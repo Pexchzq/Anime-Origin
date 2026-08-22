@@ -1842,6 +1842,9 @@ local function run()
 	local readySentGeneration = nil
 	local readySentAt = nil
 	local pendingReadyAction = nil
+	-- Set only while AutoPlay is parked waiting for a StartWaveVote it may never
+	-- receive; nil at every other time. See missedVoteRecoveryTimeout in Config.
+	local missedVoteDeadline = nil
 	-- This state is scoped to one StartWaveVote generation. TowerDict is append-only
 	-- in this game, so only workspace.Towers is authoritative scene-cleanup evidence.
 	local sceneCleanupGate = {
@@ -1987,7 +1990,12 @@ local function run()
 	else
 		expectedDesired = resolveDesiredTeam("waiting for authoritative StartWaveVote")
 		gameplayAllowed = false
-		log("DEFER", "GameStarted is false without a live vote signal; treating this as an end/loading screen until StartWaveVote arrives.")
+		-- Arm the missed-vote recovery: this is the only branch that can wait forever.
+		local recoveryWindow = math.max(0, tonumber(Settings.missedVoteRecoveryTimeout) or 20)
+		missedVoteDeadline = recoveryWindow > 0 and (os.clock() + recoveryWindow) or nil
+		log("DEFER", "GameStarted is false without a live vote signal; treating this as an end/loading screen until StartWaveVote arrives.", {
+			recoveryWindow = recoveryWindow > 0 and recoveryWindow or nil,
+		})
 	end
 	-- Render only after desiredTeam is known so square-grid capacity is derived from
 	-- live unit Limits, including when AutoPlay attaches during an active match.
@@ -2279,6 +2287,36 @@ local function run()
 		end
 
 		if not started then
+			-- Recover a StartWaveVote that was delivered before this listener existed.
+			-- Restricted to the exact shape of that failure so an end screen can never
+			-- match it: no vote generation was ever observed, the match is stopped, and
+			-- workspace.Towers has been verifiably empty. An end screen reached after a
+			-- real match always has a generation, because AutoPlay saw that match start.
+			if missedVoteDeadline and not voteState.active and voteState.generation == 0
+				and os.clock() >= missedVoteDeadline then
+				local towerCount = workspaceTowerCount()
+				if towerCount == 0 then
+					voteState.active = true
+					voteState.generation += 1
+					missedVoteDeadline = nil
+					log("RECOVER", "No StartWaveVote arrived on a stopped, empty scene; assuming the vote "
+						.. "window opened before AutoPlay attached and preparing the team.", {
+						waitedSeconds = tonumber(Settings.missedVoteRecoveryTimeout) or 20,
+						towerCount = towerCount,
+						generation = voteState.generation,
+					})
+					recordLifecycleEvent("StartWaveVoteAssumed", "AutoPlay.missedVoteRecovery",
+						{ generation = voteState.generation })
+				else
+					-- Towers still present means a scene that has not been cleaned yet,
+					-- which is an end/replay screen rather than a fresh pre-match.
+					missedVoteDeadline = os.clock() + 5
+					log("DEFER", "Missed-vote recovery deferred; the scene still holds towers.", {
+						towerCount = towerCount,
+					})
+				end
+			end
+
 			local mayPrepare = initialVoteWindow or voteState.active
 			if mayPrepare and configuredForVoteGeneration ~= voteState.generation
 				and os.clock() >= nextTeamPrepareAt then

@@ -115,6 +115,41 @@ def check_afford_stall(account: Account, out: list[Finding]) -> None:
                            {"longestRun": longest_run}))
 
 
+def check_vote_window(account: Account, out: list[Finding]) -> None:
+    """AutoPlay parked on the unit-selection screen waiting for a StartWaveVote."""
+    lines = account.log("AutoPlay")
+    if not lines:
+        return
+
+    recovered = [line for line in lines
+                 if line.tag == "RECOVER" and "StartWaveVote" in line.message]
+    if recovered:
+        out.append(Finding("WARN", "MISSED_VOTE_RECOVERED", account.user,
+                           f"AutoPlay had to assume {len(recovered)} StartWaveVote(s): the event was "
+                           f"delivered before the listener attached, most likely while the Loader was "
+                           f"still downloading after a place teleport.",
+                           {"occurrences": len(recovered), **(recovered[-1].data or {})}))
+
+    # Nothing after the deferral means the recovery never ran or never fired.
+    last_defer = None
+    for index, line in enumerate(lines):
+        if line.tag == "DEFER" and "StartWaveVote arrives" in line.message:
+            last_defer = index
+    if last_defer is None:
+        return
+
+    after = [line for line in lines[last_defer + 1:]
+             if line.tag in ("READY", "VERIFY", "PLACE", "TEAM", "RECOVER")]
+    if not after:
+        data = account.json("AutoPlay") or {}
+        out.append(Finding("RED", "VOTE_NEVER_ARRIVED", account.user,
+                           "AutoPlay deferred waiting for StartWaveVote and never voted, placed, or "
+                           "recovered afterwards; the run is parked on the unit-selection screen.",
+                           {"status": data.get("status"), "reason": data.get("reason"),
+                            "deferAtLine": lines[last_defer].seq,
+                            "linesAfterDefer": len(lines) - last_defer - 1}))
+
+
 def check_match_progress(account: Account, out: list[Finding]) -> None:
     data = account.json("AutoPlay") or {}
     gameplay = data.get("gameplay") or {}
@@ -144,6 +179,7 @@ def main() -> int:
         check_placements(account, findings)
         check_locked_slot_probes(account, findings)
         check_afford_stall(account, findings)
+        check_vote_window(account, findings)
         check_match_progress(account, findings)
 
     return report("PLAY RUNTIME", findings, accounts)

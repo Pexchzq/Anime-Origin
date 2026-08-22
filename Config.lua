@@ -430,6 +430,15 @@ local Config = {
 		-- AutoPlay attaches shortly after StartWaveVote in normal use. Keep only a
 		-- short event-listener settle period before deciding whether the vote is live.
 		voteAttachSettleDelay = 0.15,
+		-- StartWaveVote is delivered exactly once. An act transition that teleports to
+		-- a new place restarts every controller, and the Loader must re-download each
+		-- file over HTTP before AutoPlay can attach, so the event can already be gone
+		-- by the time the listener exists. That parked a run on the unit-selection
+		-- screen indefinitely with no error printed anywhere. After this many seconds
+		-- of waiting with a stopped match and a verified empty scene, AutoPlay assumes
+		-- the window opened before it attached and prepares the vote. Set 0 to disable
+		-- and keep the old wait-forever behaviour.
+		missedVoteRecoveryTimeout = 20,
 		-- A locked optional slot is a normal server rejection. Keep this probe short
 		-- so the next ready vote is not delayed by the full action verification timeout.
 		slotProbeTimeout = 0.75,
