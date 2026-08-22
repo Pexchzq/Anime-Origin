@@ -173,6 +173,8 @@ local Config = {
 		-- already contain another player or an active party, so main.lua rotates to
 		-- another verified Pod instead of retrying the first DoorUIPart forever.
 		maximumTransitionAttempts = 6,
+		-- Set false to force the original walk-into-the-Pod entry on every executor.
+		useTouchInterestEntry = true,
 		-- A route error used to end the session outright, because the Loader starts
 		-- main.lua exactly once with task.spawn + pcall. Restart the route a bounded
 		-- number of times instead; listeners are torn down and re-bound each time.
@@ -241,6 +243,19 @@ local Config = {
 		},
 
 		lobbyEntrance = {
+			-- DoorUIPart carries a TouchInterest, so the server learns a player entered
+			-- the Pod from a replicated Touched event, not from the character's real
+			-- position. firetouchinterest raises that event directly.
+			--
+			-- Verified by Probes/PodEntryBypassProbe: one call from 180 studs away, with
+			-- the character never moving, produced MapSelect and UpdatePlayersInside
+			-- naming this player, after which StartSelection was accepted. Walking is
+			-- kept as the fallback for executors without firetouchinterest.
+			--
+			-- Verification is unchanged either way: the server's own MapSelect is still
+			-- required before an entry counts.
+			touchEntryTimeout = 2,
+			touchHoldDelay = 0.15,
 			-- Scan every same-named Pod under the Story selector. portalPath remains as
 			-- a compatibility fallback for a lobby build exposing only one Pod.
 			portalRootPath = { "MainFolder", "Lobby", "MapSelectors", "Story" },

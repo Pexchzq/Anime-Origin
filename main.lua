@@ -847,6 +847,50 @@ end
 
 -- Teleport only to the outside approach point, then use Humanoid:MoveTo through
 -- the real DoorUIPart. This preserves the server's PlayersInside/MapSelect flow.
+-- MapSelect arrived. The Pod is only ours if the server's own occupancy snapshot
+-- names this player and shows nobody else holding it.
+local function confirmPodEntry(portal, beforeOccupancy)
+	-- UpdatePlayersInside normally arrives just before MapSelect, but do not
+	-- depend on network callback ordering. Give the matching local-player Pod
+	-- snapshot one short bounded window before deciding whether it is reserved.
+	if not (bus.playersInsideGeneration > beforeOccupancy
+		and bus.lastOccupancySubject == player) then
+		waitUntil(function()
+			return bus.playersInsideGeneration > beforeOccupancy
+				and bus.lastOccupancySubject == player
+		end, 0.5)
+	end
+	local matchingOccupancy = bus.playersInsideGeneration > beforeOccupancy
+		and bus.lastOccupancySubject == player
+	if matchingOccupancy and (bus.portalOccupiedByOther or bus.portalReservedByOther) then
+		local leader = bus.lastPortalPartyLeader
+		return false, "Story Pod is occupied/reserved by another player"
+			.. (leader and (" (" .. leader.Name .. ")") or ""), portal
+	end
+	return true, nil, portal
+end
+
+-- The DoorUIPart carries a TouchInterest, so the server learns that a player
+-- entered from a replicated Touched event rather than from where the character
+-- actually is. firetouchinterest raises exactly that event.
+--
+-- Measured, not assumed: PodEntryBypassProbe fired this once against the nearest
+-- door while the character stood 180 studs away and never moved. The server
+-- answered MapSelect and UpdatePlayersInside naming this player, and then
+-- accepted StartSelection. First attempt, no walking, no CFrame write.
+--
+-- This is what unblocks fresh accounts. They failed the walk on all 8 doors on
+-- every recorded run and had never once entered a stage.
+local function fireDoorTouch(portal, root)
+	if Settings.useTouchInterestEntry == false then return false end
+	if typeof(firetouchinterest) ~= "function" then return false end
+	return (pcall(function()
+		firetouchinterest(root, portal, 0)
+		task.wait(math.max(0, tonumber(Entrance.touchHoldDelay) or 0.15))
+		firetouchinterest(root, portal, 1)
+	end))
+end
+
 local function tryEnterStoryPortal(portal, deadline)
 	local character = player.Character or player.CharacterAdded:Wait()
 	local root = character:FindFirstChild("HumanoidRootPart")
@@ -856,6 +900,23 @@ local function tryEnterStoryPortal(portal, deadline)
 		return false, "Story DoorUIPart is unavailable or cannot touch", portal
 	end
 
+	local before = bus.mapSelectGeneration
+	local beforeOccupancy = bus.playersInsideGeneration
+
+	-- Touch route first: no CFrame write, no pathing, no walk budget. The proof is
+	-- unchanged -- the server's own MapSelect still has to arrive.
+	if fireDoorTouch(portal, root) then
+		local touchTimeout = math.max(0.1, tonumber(Entrance.touchEntryTimeout) or 2)
+		if waitUntil(function() return bus.mapSelectGeneration > before end, touchTimeout) then
+			log("PORTAL_TOUCH", "Server accepted a fired door touch; the character never moved.", {
+				portal = portalKey(portal),
+			})
+			return confirmPodEntry(portal, beforeOccupancy)
+		end
+	end
+
+	-- Executors without firetouchinterest, and any build where the server stops
+	-- trusting a replicated touch, still walk in the original way.
 	local pod = portal.Parent
 	local insideCenter = modelCenter(pod and pod:FindFirstChild("InsideModel"))
 	local flat = insideCenter and Vector3.new(
@@ -875,35 +936,15 @@ local function tryEnterStoryPortal(portal, deadline)
 	outside = Vector3.new(outside.X, y, outside.Z)
 	inside = Vector3.new(inside.X, y, inside.Z)
 
-	local before = bus.mapSelectGeneration
-	local beforeOccupancy = bus.playersInsideGeneration
 	root.CFrame = CFrame.lookAt(outside, inside)
 	task.wait(tonumber(Entrance.teleportSettleDelay) or 0.2)
 	local attemptDeadline = math.min(deadline, os.clock() + (tonumber(Entrance.walkTimeout) or 3))
 	repeat
 		humanoid:MoveTo(inside)
-		local observed = waitUntil(function()
+		if waitUntil(function()
 			return bus.mapSelectGeneration > before
-		end, math.min(0.35, math.max(0, attemptDeadline - os.clock())))
-		if observed then
-			-- UpdatePlayersInside normally arrives just before MapSelect, but do not
-			-- depend on network callback ordering. Give the matching local-player Pod
-			-- snapshot one short bounded window before deciding whether it is reserved.
-			if not (bus.playersInsideGeneration > beforeOccupancy
-				and bus.lastOccupancySubject == player) then
-				waitUntil(function()
-					return bus.playersInsideGeneration > beforeOccupancy
-						and bus.lastOccupancySubject == player
-				end, 0.5)
-			end
-			local matchingOccupancy = bus.playersInsideGeneration > beforeOccupancy
-				and bus.lastOccupancySubject == player
-			if matchingOccupancy and (bus.portalOccupiedByOther or bus.portalReservedByOther) then
-				local leader = bus.lastPortalPartyLeader
-				return false, "Story Pod is occupied/reserved by another player"
-					.. (leader and (" (" .. leader.Name .. ")") or ""), portal
-			end
-			return true, nil, portal
+		end, math.min(0.35, math.max(0, attemptDeadline - os.clock()))) then
+			return confirmPodEntry(portal, beforeOccupancy)
 		end
 	until not controller.active or os.clock() >= attemptDeadline
 	return false, "server did not emit MapSelect for this Story Pod", portal
