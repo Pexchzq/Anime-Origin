@@ -158,6 +158,13 @@ local Config = {
 		-- catch late PlayerData without scanning hundreds of thousands of objects at 10 Hz.
 		runtimeDiscoveryInterval = 0.5,
 		transitionVerifyTimeout = 12,
+		-- Walking into a Story Pod is only how the game's own UI opens the map screen;
+		-- the selection itself is MapSelectRemote "StartSelection", which main.lua fires
+		-- either way. Ask the server directly first and keep the walk as the fallback.
+		-- Acceptance proof is unchanged: a matching AfterMapSelect from the server.
+		-- Set false to restore the walk-first order.
+		preferDirectSelection = true,
+		directSelectionTimeout = 5,
 		transitionRetryDelay = 1,
 		-- A Story row contains several Pod instances with identical names. A Pod can
 		-- already contain another player or an active party, so main.lua rotates to

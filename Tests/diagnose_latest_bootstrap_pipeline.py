@@ -236,6 +236,36 @@ def check_vacuous_completion(account: Account, out: list[Finding]) -> None:
                             "totalSummons": total, "gemsAfterClaims": state.get("gemsAfterClaims")}))
 
 
+def check_stage_entry(account: Account, out: list[Finding]) -> None:
+    """Pod walks the server never acknowledged at all.
+
+    Entering a Story Pod is supposed to make the server emit MapSelect, and every
+    later step (AfterMapSelect, UpdatePlayersInside, TeleportGui) is logged as
+    MAP_EVENT too. Portal failures with not one MAP_EVENT of any kind means the
+    server never registered the player entering: the walk is not losing a race,
+    it is not landing. In the captured run this was 100% of accounts with zero
+    clears, while an established account on the same build played to Wave 6.
+    """
+    lines = account.log("MainRoute")
+    if not lines:
+        return
+    failures = [line for line in lines
+                if line.tag == "PORTAL" and "No available Story Pod" in line.message]
+    if not failures:
+        return
+    if any(line.tag == "MAP_EVENT" for line in lines):
+        return
+
+    state = account.json("MainRoute", latest=False) or {}
+    out.append(Finding("RED", "STAGE_ENTRY_BLOCKED", account.user,
+                       f"{len(failures)} Pod walk(s) failed and the server never emitted a single "
+                       f"MapSelect; stage entry is being refused outright, not merely timing out.",
+                       {"portalFailures": len(failures),
+                        "matchEpoch": state.get("matchEpoch"),
+                        "everEnteredAStage": bool(state.get("matchEpoch")),
+                        "lastPortalError": failures[-1].get("error")}))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--user", action="append", help="restrict to this UserId (repeatable)")
@@ -251,6 +281,7 @@ def main() -> int:
         check_settings(account, findings)
         check_unit_progression(account, findings)
         check_route_handoff(account, findings)
+        check_stage_entry(account, findings)
 
     return report("BOOTSTRAP PIPELINE", findings, accounts)
 

@@ -212,6 +212,28 @@ if typeof(writefile) == "function" then writefile(logFile, "") end
 
 if typeof(getgc) ~= "function" then fail("RUNTIME", "UnitProgression requires getgc(true).") end
 
+-- Both predicates live here, above the snapshot acquisition, because the
+-- acquisition has to test for exactly what the discovery below requires. When the
+-- probe was a separate copy it drifted: it accepted a table carrying MaxTowerLevel
+-- and GetTowerLevelFromExp but not NeededTowerLevelExp, declared the snapshot
+-- usable on the first try, and then the real scan still failed with "Level formula
+-- module was not found" -- with no rescan, because the probe had already said yes.
+local function isPlayerData(value)
+	if typeof(value) ~= "table" then return false end
+	local inventory = rawget(value, "Inventory")
+	return typeof(inventory) == "table"
+		and typeof(rawget(inventory, "Towers")) == "table"
+		and typeof(rawget(inventory, "Currency")) == "table"
+		and typeof(rawget(value, "EquippedTowers")) == "table"
+end
+
+local function isLevelModule(value)
+	if typeof(value) ~= "table" then return false end
+	return typeof(rawget(value, "MaxTowerLevel")) == "number"
+		and typeof(rawget(value, "GetTowerLevelFromExp")) == "function"
+		and typeof(rawget(value, "NeededTowerLevelExp")) == "function"
+end
+
 -- The Loader starts this file the moment the place finishes teleporting, so the
 -- very first getgc(true) routinely lands in a lobby whose modules have not been
 -- created yet. Everything below reads that one snapshot and turns any miss into a
@@ -226,15 +248,10 @@ local function snapshotIsUsable(objects)
 	local hasLevelModule, hasPlayerData = false, false
 	for _, object in ipairs(objects) do
 		if typeof(object) == "table" then
-			if not hasLevelModule
-				and typeof(rawget(object, "MaxTowerLevel")) == "number"
-				and typeof(rawget(object, "GetTowerLevelFromExp")) == "function" then
-				hasLevelModule = true
-			end
-			if not hasPlayerData then
-				local nested = rawget(object, "PlayerData")
-				local probe = typeof(nested) == "table" and nested or object
-				if typeof(rawget(probe, "Inventory")) == "table" then hasPlayerData = true end
+			if not hasLevelModule and isLevelModule(object) then hasLevelModule = true end
+			if not hasPlayerData
+				and (isPlayerData(object) or isPlayerData(rawget(object, "PlayerData"))) then
+				hasPlayerData = true
 			end
 			if hasLevelModule and hasPlayerData then return true end
 		end
@@ -271,15 +288,6 @@ do
 			usable = usable,
 		})
 	end
-end
-
-local function isPlayerData(value)
-	if typeof(value) ~= "table" then return false end
-	local inventory = rawget(value, "Inventory")
-	return typeof(inventory) == "table"
-		and typeof(rawget(inventory, "Towers")) == "table"
-		and typeof(rawget(inventory, "Currency")) == "table"
-		and typeof(rawget(value, "EquippedTowers")) == "table"
 end
 
 -- Keep the stable container instead of freezing the first direct PlayerData
@@ -457,10 +465,7 @@ end
 
 for index, object in ipairs(gcObjects) do
 	if typeof(object) == "table" then
-		if not levelModule
-			and typeof(rawget(object, "MaxTowerLevel")) == "number"
-			and typeof(rawget(object, "GetTowerLevelFromExp")) == "function"
-			and typeof(rawget(object, "NeededTowerLevelExp")) == "function" then
+		if not levelModule and isLevelModule(object) then
 			levelModule, levelModuleSource = object, "getgc[" .. index .. "]"
 		end
 

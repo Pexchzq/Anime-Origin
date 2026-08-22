@@ -705,6 +705,17 @@ local function resolveWorkspacePath(path)
 	return current
 end
 
+-- Sibling Story Pods share both their Name and their GetFullName path, so a log
+-- line that prints only the path cannot tell one door from another -- every
+-- captured failure looked like the same door being retried. The rounded world
+-- position is the cheap identity that actually distinguishes them.
+local function portalKey(door)
+	if typeof(door) ~= "Instance" then return nil end
+	local ok, position = pcall(function() return door.Position end)
+	if not ok or typeof(position) ~= "Vector3" then return nil end
+	return string.format("%.1f,%.1f,%.1f", position.X, position.Y, position.Z)
+end
+
 local recentPortalFailures = {}
 -- How many times each door refused us this session. A timestamp alone cannot
 -- deprioritise a door for longer than one attempt takes.
@@ -1028,55 +1039,100 @@ local function startSelectedStage(target)
 		fail("REMOTE", "MapSelectRemote did not replicate in the lobby.")
 	end
 	local action = recordAction("SELECT_STAGE", target)
-	for attempt = 1, math.max(1, tonumber(Settings.maximumTransitionAttempts) or 2) do
+	local maximumAttempts = math.max(1, tonumber(Settings.maximumTransitionAttempts) or 2)
+
+	-- Ask the server to select the stage and report whether it accepted. This is the
+	-- same remote and the same acceptance proof the physical route uses: a matching
+	-- AfterMapSelect. Nothing about verification is relaxed by calling it directly.
+	local function requestSelection(timeout)
+		local beforeSelection = bus.afterMapSelectGeneration
+		mapRemote:FireServer("StartSelection", target.mode, target.world, tostring(target.act), target.difficulty)
+		return waitUntil(function()
+			return bus.afterMapSelectGeneration > beforeSelection
+				and targetMatches(bus.afterMapSelect, target)
+		end, timeout or verifyTimeout)
+	end
+
+	-- Selection is accepted; ask for the teleport and require TeleportGui as proof.
+	local function completeTeleport(via, attempt)
+		action.selectionVerified = true
+		action.selectionVia = via
+		action.selectionAttempt = attempt
+		saveReport("selection verified")
+
+		local beforeTeleport = bus.teleportGeneration
+		local teleportAction = recordAction("START_TELEPORT", target)
+		mapRemote:FireServer("StartTeleport")
+		local teleported = waitUntil(function() return bus.teleportGeneration > beforeTeleport end, verifyTimeout)
+		teleportAction.verified = teleported
+		action.verified = teleported
+		if not teleported then
+			log("VERIFY", "StartTeleport was not confirmed; no blind success recorded.",
+				{ attempt = attempt, via = via })
+			return false
+		end
+		state.lastTransition = "START_TELEPORT"
+		state.lastTransitionVerifiedAt = os.time()
+		saveState("server accepted stage teleport")
+		report.status = "TELEPORTING_TO_STAGE"
+		saveReport("stage teleport verified")
+		return true
+	end
+
+	-- Walking into a Pod is only how the game's own UI opens the map screen; the
+	-- selection itself is this remote. Asking directly costs one bounded wait and
+	-- takes character spawn, CFrame writes, humanoid pathing, the 3s walk budget and
+	-- server-side touch detection off the happy path entirely.
+	--
+	-- The captured run makes the case: every account with zero clears failed the walk
+	-- on all 24 attempts and never emitted a single MapSelect, while 11540208855 --
+	-- same build, same executor, same session -- played Infinite to Wave 6. The walk
+	-- is not a dependable gate for a fresh account, and today it is a hard gate: when
+	-- it fails, StartSelection is never even attempted, so the server is never asked.
+	local directTimeout = tonumber(Settings.directSelectionTimeout) or 5
+	if Settings.preferDirectSelection ~= false then
+		if requestSelection(directTimeout) then
+			log("SELECT", "Server accepted the stage selection without a Pod walk.", { target = target })
+			if completeTeleport("direct", 0) then return true end
+		else
+			log("SELECT", "Server did not accept a direct selection; falling back to the Pod walk.",
+				{ waited = directTimeout })
+		end
+	end
+
+	for attempt = 1, maximumAttempts do
 		local entered, entryError, selectedPortal = enterStoryPortal()
 		log("PORTAL", entered and "Story portal entry evidence observed." or "No available Story Pod accepted the player.", {
 			attempt = attempt,
 			error = entryError,
 			portal = selectedPortal,
+			-- Sibling Pods share a name, so GetFullName cannot tell them apart. The
+			-- position can, which is the only way to see whether rotation is working.
+			portalPosition = selectedPortal and portalKey(selectedPortal) or nil,
+			candidates = #resolvePortalCandidates(),
 		})
-		if not entered then
-			if attempt < (tonumber(Settings.maximumTransitionAttempts) or 2) then
-				task.wait(tonumber(Settings.transitionRetryDelay) or 1)
+		if entered then
+			if requestSelection() then
+				if completeTeleport("pod-walk", attempt) then return true end
+			else
+				if selectedPortal then
+					recentPortalFailures[selectedPortal] = os.clock()
+					portalFailureCounts[selectedPortal] = (portalFailureCounts[selectedPortal] or 0) + 1
+				end
+				log("VERIFY", "StartSelection was not confirmed by matching AfterMapSelect.", { attempt = attempt })
 			end
-			continue
 		end
-
-		local beforeSelection = bus.afterMapSelectGeneration
-		mapRemote:FireServer("StartSelection", target.mode, target.world, tostring(target.act), target.difficulty)
-		local accepted = waitUntil(function()
-			return bus.afterMapSelectGeneration > beforeSelection and targetMatches(bus.afterMapSelect, target)
-		end, verifyTimeout)
-		if accepted then
-			action.selectionVerified = true
-			action.selectionAttempt = attempt
-			saveReport("selection verified")
-
-			local beforeTeleport = bus.teleportGeneration
-			local teleportAction = recordAction("START_TELEPORT", target)
-			mapRemote:FireServer("StartTeleport")
-			local teleported = waitUntil(function() return bus.teleportGeneration > beforeTeleport end, verifyTimeout)
-			teleportAction.verified = teleported
-			action.verified = teleported
-			if teleported then
-				state.lastTransition = "START_TELEPORT"
-				state.lastTransitionVerifiedAt = os.time()
-				saveState("server accepted stage teleport")
-				report.status = "TELEPORTING_TO_STAGE"
-				saveReport("stage teleport verified")
-				return true
-			end
-			log("VERIFY", "StartTeleport was not confirmed; no blind success recorded.", { attempt = attempt })
-		else
-			if selectedPortal then
-				recentPortalFailures[selectedPortal] = os.clock()
-				portalFailureCounts[selectedPortal] = (portalFailureCounts[selectedPortal] or 0) + 1
-			end
-			log("VERIFY", "StartSelection was not confirmed by matching AfterMapSelect.", { attempt = attempt })
-		end
-		if attempt < (tonumber(Settings.maximumTransitionAttempts) or 2) then
+		if attempt < maximumAttempts then
 			task.wait(tonumber(Settings.transitionRetryDelay) or 1)
 		end
+	end
+
+	-- Account state can change while the walk is being retried -- the captured run
+	-- shows EquipStarterSelected arriving mid-sequence -- so ask once more before
+	-- giving up rather than burning a whole supervised restart.
+	if Settings.preferDirectSelection ~= false and requestSelection(directTimeout) then
+		log("SELECT", "Server accepted a direct selection after the Pod walks failed.", { target = target })
+		if completeTeleport("direct-retry", maximumAttempts) then return true end
 	end
 	return false
 end

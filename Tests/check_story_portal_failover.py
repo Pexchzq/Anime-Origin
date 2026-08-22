@@ -42,8 +42,28 @@ assert "(root.Position - inside).Magnitude <= 3" not in entry, (
 selection_start = MAIN.index("local function startSelectedStage")
 selection_end = MAIN.index("local function ensureLobbyLoadout", selection_start)
 selection = MAIN[selection_start:selection_end]
-assert "if not entered then" in selection, (
-    "StartSelection must be skipped when no Story portal accepted the player"
+# This used to assert `if not entered then`, i.e. that StartSelection could only be
+# fired after a Pod walk succeeded. That was the control-flow shape, not the safety
+# property, and it made the walk a hard gate: every account with zero clears failed
+# the walk 100% of the time, so the server was never even asked. The walk is now the
+# fallback and the remote is tried first.
+#
+# What must never weaken is the evidence standard, so assert that instead: a
+# selection counts only when the server echoes a matching AfterMapSelect, and a
+# teleport counts only when the server raises TeleportGui. Deleting either check --
+# or the walk fallback -- fails here.
+assert "targetMatches(bus.afterMapSelect, target)" in selection, (
+    "selection must be proven by a matching AfterMapSelect from the server"
+)
+assert "bus.teleportGeneration > beforeTeleport" in selection, (
+    "teleport must be proven by the server's TeleportGui event"
+)
+assert "enterStoryPortal()" in selection, (
+    "the Pod walk must remain available as a fallback when the server refuses a "
+    "direct selection"
+)
+assert selection.index("StartSelection") < selection.index("enterStoryPortal()"), (
+    "the direct StartSelection must be attempted before falling back to the walk"
 )
 
 # Do not discover occupancy by teleporting through every candidate. Physical
