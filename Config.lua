@@ -47,9 +47,22 @@ local Config = {
 		-- A write-ahead state file lets an interrupted run resume after its first
 		-- ten-pull has already changed TotalSummons from 0 to 10.
 		bootstrap = {
+			-- ELIGIBILITY, decided once on the first run that ever sees the account and
+			-- then persisted as accountClass. Only an account sitting at exactly this
+			-- many TotalSummons is NEW; everything above it is a farming account whose
+			-- Gems are never spent, no matter how many it accumulates later.
+			--
+			-- maximumSummonBatches below is the SPENDING CEILING, never an eligibility
+			-- test. Treating "under 20 batches" as new would reclassify every farming
+			-- account that has not yet reached 200 summons and drain it.
 			newAccountTotalSummons = 0,
 			expectedSummonsPerBatch = 10,
+			-- Ceiling for one account's entire bootstrap: 20 x 10 = 200 summons.
 			maximumSummonBatches = 20,
+			-- UserIds listed here are re-classified as NEW even when TotalSummons is
+			-- above the gate. Use it only to finish a bootstrap whose state file was
+			-- lost; leaving an id here lets that account spend Gems on every run.
+			forceBootstrapUserIds = {},
 			summonBatchCost = 500,
 			verifyTimeout = 10,
 			-- Faster polling is safe because every mutation still requires PlayerData

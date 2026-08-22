@@ -687,73 +687,100 @@ local function claimConfiguredRewards()
 	end
 end
 
+-- An account is classified exactly once, the first time FastMode ever sees it, and
+-- the verdict is persisted before any remote call. Re-deciding it on later runs is
+-- what let a farming account be mistaken for a new one and spend 1500 Gems it was
+-- meant to keep.
+--
+-- Only TotalSummons == 0 means new. maximumSummonBatches is the spending ceiling
+-- for a new account, never an eligibility test: treating "below 20 batches" as new
+-- would reclassify every farming account that has not yet reached 200 summons.
+local function classifyAccount(currentTotal)
+	local persisted = state.accountClass
+	if persisted == "NEW" or persisted == "FARMING" then
+		return persisted, "persisted"
+	end
+
+	local forced = Bootstrap.forceBootstrapUserIds
+	if typeof(forced) == "table" then
+		for _, userId in ipairs(forced) do
+			if tostring(userId) == tostring(player.UserId) then
+				return "NEW", "forced by Config.forceBootstrapUserIds"
+			end
+		end
+	end
+
+	local newAccountValue = tonumber(Bootstrap.newAccountTotalSummons) or 0
+	if currentTotal == newAccountValue then
+		return "NEW", string.format("TotalSummons==%d on first sight", newAccountValue)
+	end
+	-- Includes the case of a lost state file on a part-way account: refusing to
+	-- summon leaves an incomplete roster, while guessing wrong spends real Gems.
+	return "FARMING", string.format("TotalSummons==%d on first sight", currentTotal)
+end
+
 local function run()
 	local currentTotal = readTotalSummons()
-	local newAccountValue = tonumber(Bootstrap.newAccountTotalSummons) or 0
 	local resumable = state.bootstrapStarted == true and state.status ~= "complete"
 
 	log("STEP", string.format("[1/4] TotalSummons=%d | state=%s", currentTotal, tostring(state.status)))
+
+	local accountClass, classReason = classifyAccount(currentTotal)
+	if state.accountClass ~= accountClass then
+		state.accountClass = accountClass
+		state.accountClassReason = classReason
+		state.accountClassifiedAt = os.time()
+		saveState(state, "account_classified_" .. string.lower(accountClass))
+	end
+	log("CLASS", string.format("Account is %s (%s).", accountClass, classReason), {
+		totalSummons = currentTotal,
+		summonsAllowed = accountClass == "NEW",
+	})
+
 	lockConfiguredUnits("existing inventory")
 
-	-- Every account may claim free rewards. TotalSummons gates only the summon
-	-- bootstrap, so an existing account can redeem a newly-added code or collect a
-	-- currently available Daily/Playtime/Battlepass/Wheel reward without spending.
-	if not resumable and currentTotal ~= newAccountValue then
-		-- An existing account is not a new account, but it still accumulates Gems from
-		-- farming, newly added codes, and today's rewards. Ending the run here used to
-		-- strand every one of them: FastMode is the only module in the project that
-		-- spends Gems, so once this branch was taken the account could never summon
-		-- again. Claim first, then re-evaluate the budget against the real balance.
-		log("GATE", "Existing account detected; claiming rewards before re-evaluating the summon budget.", {
-			totalSummons = currentTotal,
-			expectedNewAccountValue = newAccountValue,
-		})
+	-- Every account may claim free rewards. The account class gates only summoning, so
+	-- a farming account still redeems a newly-added code or collects a currently
+	-- available Daily/Playtime/Battlepass/Wheel reward -- it just never spends.
+	local function claimsOnlyRun(reason, details)
+		log("GATE", reason, details)
 		state.lastClaimsOnlyStartedAt = os.time()
 		state.claimResults = state.claimResults or { codes = {}, playTimeRewards = {} }
-		saveState(state, "existing_account_claims_started")
+		saveState(state, "claims_only_started")
 		log("STEP", "[2/4] Claiming every currently available free reward...")
 		redeemCodes()
 		claimConfiguredRewards()
 		state.lastClaimsOnlyCompletedAt = os.time()
+		saveState(state, "claims_only_complete_no_summons")
+		log("STEP", string.format("[4/4] DONE claims only | Gems=%d | TotalSummons=%d | no summons.",
+			readGems(), readTotalSummons()))
+		return {
+			status = "CLAIMS_ONLY_COMPLETE",
+			accountClass = accountClass,
+			gems = readGems(),
+			totalSummons = readTotalSummons(),
+			stateFile = stateFile,
+			logFile = logFile,
+		}
+	end
 
-		local claimBatchCost = math.max(1, tonumber(Bootstrap.summonBatchCost) or 500)
-		local claimMaximum = math.max(0, math.floor(tonumber(Bootstrap.maximumSummonBatches) or 10))
-		local gemsAfterClaims = readGems()
-		local affordable = math.min(math.floor(gemsAfterClaims / claimBatchCost), claimMaximum)
+	if accountClass == "FARMING" then
+		return claimsOnlyRun("Farming account; Gems are never spent here.", {
+			totalSummons = currentTotal,
+			classReason = classReason,
+		})
+	end
 
-		if Bootstrap.spendAllAvailableGems ~= true or affordable < 1 then
-			saveState(state, "existing_account_claims_complete_no_summons")
-			log("STEP", string.format("[4/4] DONE claims only | Gems=%d | TotalSummons=%d | no summons.",
-				gemsAfterClaims, readTotalSummons()))
-			return {
-				status = "CLAIMS_ONLY_COMPLETE",
-				gems = gemsAfterClaims,
-				totalSummons = readTotalSummons(),
-				stateFile = stateFile,
-				logFile = logFile,
-			}
-		end
-
-		-- Enough for at least one ten-pull. Open a fresh summon budget for this run and
-		-- fall through to the normal summon loop instead of returning.
-		state.bootstrapStarted = true
-		state.startedAt = os.time()
-		state.startTotalSummons = readTotalSummons()
-		state.verifiedBatches = 0
-		state.gemsAfterClaims = gemsAfterClaims
-		state.targetBatches = affordable
-		state.status = "summoning"
-		saveState(state, "existing_account_summon_budget_opened")
-		log("BUDGET", string.format("Gems=%d | ten-pull target=%d/%d for this existing account.",
-			gemsAfterClaims, affordable, claimMaximum))
-		-- The budget is now persisted, so the blocks below must treat this run the
-		-- same way they treat a resumed bootstrap: no re-claiming, no target reset.
-		resumable = true
+	-- A new account that already finished its bootstrap never re-opens, however many
+	-- Gems it farms afterwards. Only an interrupted bootstrap resumes.
+	if state.status == "complete" then
+		return claimsOnlyRun("Bootstrap already completed for this account; claiming only.", {
+			verifiedBatches = state.verifiedBatches,
+			targetBatches = state.targetBatches,
+		})
 	end
 
 	if not resumable then
-		-- A completed zero-summon account may be re-opened if it later receives Gems.
-		-- The user's rule explicitly allows spending all Gems while TotalSummons is 0.
 		state.bootstrapStarted = true
 		state.status = "claiming"
 		state.startedAt = os.time()
@@ -785,7 +812,11 @@ local function run()
 		local batchCost = math.max(1, tonumber(Bootstrap.summonBatchCost) or 500)
 		local maximum = math.max(0, math.floor(tonumber(Bootstrap.maximumSummonBatches) or 10))
 		state.gemsAfterClaims = readGems()
-		state.targetBatches = math.min(math.floor(state.gemsAfterClaims / batchCost), maximum)
+		-- Hard ceiling on the bootstrap as a whole. A new account starts at zero
+		-- summons and must never be pushed past maximumSummonBatches ten-pulls in
+		-- total, however many Gems the claims turned out to produce.
+		local remainingBudget = math.max(0, maximum - (tonumber(state.verifiedBatches) or 0))
+		state.targetBatches = math.min(math.floor(state.gemsAfterClaims / batchCost), remainingBudget)
 		state.status = "summoning"
 		saveState(state, "frozen_summon_target_after_claims")
 		log("BUDGET", string.format("Gems=%d | frozen ten-pull target=%d/%d.",
