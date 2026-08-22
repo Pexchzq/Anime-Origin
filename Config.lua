@@ -158,12 +158,15 @@ local Config = {
 		-- catch late PlayerData without scanning hundreds of thousands of objects at 10 Hz.
 		runtimeDiscoveryInterval = 0.5,
 		transitionVerifyTimeout = 12,
-		-- Walking into a Story Pod is only how the game's own UI opens the map screen;
-		-- the selection itself is MapSelectRemote "StartSelection", which main.lua fires
-		-- either way. Ask the server directly first and keep the walk as the fallback.
-		-- Acceptance proof is unchanged: a matching AfterMapSelect from the server.
-		-- Set false to restore the walk-first order.
-		preferDirectSelection = true,
+		-- DISPROVEN, kept off. The theory was that MapSelectRemote "StartSelection"
+		-- would be accepted without walking into a Pod, since main.lua fires that remote
+		-- either way. It was tried and the server refused it 26 times out of 26, with no
+		-- AfterMapSelect and no MapSelect of any kind -- on the same accounts and in the
+		-- same session where the Pod walk also failed on all 8 doors. Selection is gated
+		-- by something else on a fresh account, not by which of the two paths is used.
+		-- Leaving this on costs 5s per attempt and buys nothing, so it defaults to false
+		-- until a remote trace from a real client shows what the gate actually is.
+		preferDirectSelection = false,
 		directSelectionTimeout = 5,
 		transitionRetryDelay = 1,
 		-- A Story row contains several Pod instances with identical names. A Pod can
