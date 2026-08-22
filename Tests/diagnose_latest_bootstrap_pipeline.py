@@ -165,6 +165,77 @@ def check_route_handoff(account: Account, out: list[Finding]) -> None:
                            f"act='{target.get('act')}'.", {"target": target}))
 
 
+def check_stale_playerdata(account: Account, out: list[Finding]) -> None:
+    """Remotes the server accepted while our PlayerData copy never moved.
+
+    This is a dead reference, not a rejected request: the server answered "Code
+    Redeemed!" while Gems stayed at zero, because the run was reading a detached
+    warm-up PlayerData table instead of the live one.
+
+    The trigger is freshly redeemed codes specifically. An unverified daily or
+    battlepass claim is ordinary -- an account that already claimed today gets a
+    genuine refusal (11540208855: the wheel returned nil and LastClaimTime was
+    already set). A code the server had NOT already recorded and answers "Code
+    Redeemed!" to must move Gems, so several of those moving nothing, with no
+    other action verifying either, can only mean the table being read is dead.
+    """
+    state = account.json("FastModeBootstrap", latest=False) or {}
+    results = state.get("claimResults") or {}
+    attempted: list[str] = []
+    verified: list[str] = []
+
+    codes = results.get("codes")
+    if isinstance(codes, dict):
+        for code, record in codes.items():
+            if not isinstance(record, dict) or record.get("status") != "redeemed":
+                continue
+            attempted.append(f"code:{code}")
+            if record.get("verified"):
+                verified.append(f"code:{code}")
+
+    for key in ("dailyReward", "dailyWheel", "battlepass", "quests"):
+        record = results.get(key)
+        if not isinstance(record, dict) or not record.get("attempted"):
+            continue
+        attempted.append(key)
+        if record.get("verified"):
+            verified.append(key)
+
+    fresh_codes = [name for name in attempted if name.startswith("code:")]
+    if len(fresh_codes) >= 3 and not verified:
+        out.append(Finding("RED", "STALE_PLAYERDATA", account.user,
+                           f"{len(attempted)} server-accepted action(s) and not one changed the "
+                           f"PlayerData this run was reading; the reference is detached from the "
+                           f"live table, so Gems and TotalSummons are being read from a dead copy.",
+                           {"attempted": len(attempted), "freshlyRedeemedCodes": len(fresh_codes),
+                            "verified": 0,
+                            "gemsAfterClaims": state.get("gemsAfterClaims"),
+                            "sample": attempted[:6]}))
+
+
+def check_vacuous_completion(account: Account, out: list[Finding]) -> None:
+    """A bootstrap sealed as complete that never summoned anything.
+
+    verifiedBatches == 0 on an account still at zero summons is not a finished
+    bootstrap; it is a run that gave up on bad data and then locked itself out,
+    because a completed bootstrap never re-opens.
+    """
+    state = account.json("FastModeBootstrap", latest=False) or {}
+    if state.get("status") != "complete":
+        return
+    batches = state.get("verifiedBatches") or 0
+    total = state.get("finishedTotalSummons")
+    if total is None:
+        total = state.get("startTotalSummons") or 0
+    if batches == 0 and total == 0:
+        out.append(Finding("RED", "BOOTSTRAP_SEALED_EMPTY", account.user,
+                           "Bootstrap is recorded complete with zero verified batches on an "
+                           "account that still has zero summons; it will start every match with "
+                           "an empty inventory and never re-open on its own.",
+                           {"verifiedBatches": batches, "targetBatches": state.get("targetBatches"),
+                            "totalSummons": total, "gemsAfterClaims": state.get("gemsAfterClaims")}))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--user", action="append", help="restrict to this UserId (repeatable)")
@@ -175,6 +246,8 @@ def main() -> int:
     findings: list[Finding] = []
     for account in accounts:
         check_fastmode(account, findings)
+        check_stale_playerdata(account, findings)
+        check_vacuous_completion(account, findings)
         check_settings(account, findings)
         check_unit_progression(account, findings)
         check_route_handoff(account, findings)

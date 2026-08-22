@@ -211,8 +211,67 @@ ensureFolder()
 if typeof(writefile) == "function" then writefile(logFile, "") end
 
 if typeof(getgc) ~= "function" then fail("RUNTIME", "UnitProgression requires getgc(true).") end
-local gcOK, gcObjects = pcall(getgc, true)
-if not gcOK or typeof(gcObjects) ~= "table" then fail("RUNTIME", "getgc(true) failed.") end
+
+-- The Loader starts this file the moment the place finishes teleporting, so the
+-- very first getgc(true) routinely lands in a lobby whose modules have not been
+-- created yet. Everything below reads that one snapshot and turns any miss into a
+-- fatal error, which is why this worker reported "Level formula module was not
+-- found" on four of four accounts while the same lobby served main.lua correctly
+-- seconds later. Keep re-taking the snapshot until it is both plausibly sized and
+-- actually carries what this file needs; a genuinely absent module still fails
+-- below, but a merely late one no longer kills the worker for the session.
+local function snapshotIsUsable(objects)
+	if typeof(objects) ~= "table" then return false end
+	if #objects < (tonumber(Settings.minimumGCSnapshotSize) or 1000) then return false end
+	local hasLevelModule, hasPlayerData = false, false
+	for _, object in ipairs(objects) do
+		if typeof(object) == "table" then
+			if not hasLevelModule
+				and typeof(rawget(object, "MaxTowerLevel")) == "number"
+				and typeof(rawget(object, "GetTowerLevelFromExp")) == "function" then
+				hasLevelModule = true
+			end
+			if not hasPlayerData then
+				local nested = rawget(object, "PlayerData")
+				local probe = typeof(nested) == "table" and nested or object
+				if typeof(rawget(probe, "Inventory")) == "table" then hasPlayerData = true end
+			end
+			if hasLevelModule and hasPlayerData then return true end
+		end
+	end
+	return false
+end
+
+local gcObjects
+do
+	local timeout = math.max(0, tonumber(Settings.runtimeLoadTimeout) or 60)
+	local interval = math.max(0.1, tonumber(Settings.runtimeDiscoveryInterval) or 0.5)
+	local deadline = os.clock() + timeout
+	local attempts, usable = 0, false
+	repeat
+		attempts += 1
+		local ok, objects = pcall(getgc, true)
+		if ok and typeof(objects) == "table" then
+			-- Keep the newest snapshot either way: if the deadline expires we still
+			-- want the best view available rather than no view at all.
+			if typeof(gcObjects) == "table" and gcObjects ~= objects then table.clear(gcObjects) end
+			gcObjects = objects
+			usable = snapshotIsUsable(objects)
+		end
+		if usable then break end
+		task.wait(interval)
+	until os.clock() >= deadline
+	if typeof(gcObjects) ~= "table" then fail("RUNTIME", "getgc(true) failed.") end
+	if attempts > 1 then
+		log("RUNTIME", usable
+			and "Lobby definitions were absent from the first getgc snapshot; rescanned until they appeared."
+			or "Lobby definitions never appeared within the load timeout; continuing on the last snapshot.", {
+			attempts = attempts,
+			objects = #gcObjects,
+			usable = usable,
+		})
+	end
+end
 
 local function isPlayerData(value)
 	if typeof(value) ~= "table" then return false end

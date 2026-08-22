@@ -34,12 +34,15 @@ def classify(user: str, state: dict) -> tuple[str, str]:
         return persisted, "persisted"
     if user in FORCED_USER_IDS:
         return "NEW", "forced by Config.forceBootstrapUserIds"
-    total = state.get("finishedTotalSummons")
+    # Classification happens once, on the summon count seen at FIRST sight. A NEW
+    # account that then summons 130 units is still NEW -- comparing against the
+    # finished count would call every successful bootstrap a misclassification.
+    total = state.get("startTotalSummons")
     if total is None:
-        total = state.get("startTotalSummons") or 0
+        total = state.get("finishedTotalSummons") or 0
     if total == NEW_ACCOUNT_TOTAL_SUMMONS:
-        return "NEW", f"TotalSummons=={total} on first sight"
-    return "FARMING", f"TotalSummons=={total} on first sight"
+        return "NEW", f"TotalSummons=={total} at classification"
+    return "FARMING", f"TotalSummons=={total} at classification"
 
 
 def may_summon(state: dict, account_class: str) -> tuple[bool, str]:
@@ -58,6 +61,9 @@ def main() -> int:
         state = Account(user).json("FastModeBootstrap", latest=False)
         if not state:
             continue
+        classified_at = state.get("startTotalSummons")
+        if classified_at is None:
+            classified_at = state.get("finishedTotalSummons") or 0
         total = state.get("finishedTotalSummons") or state.get("startTotalSummons") or 0
         gems = state.get("finishedGems") or 0
         account_class, reason = classify(user, state)
@@ -65,9 +71,9 @@ def main() -> int:
         would_spend = min(gems // SUMMON_BATCH_COST, MAXIMUM_SUMMON_BATCHES) * SUMMON_BATCH_COST if allowed else 0
         rows.append((user, total, gems, account_class, allowed, would_spend, why))
 
-        if account_class == "NEW" and total > NEW_ACCOUNT_TOTAL_SUMMONS and user not in FORCED_USER_IDS:
+        if account_class == "NEW" and classified_at > NEW_ACCOUNT_TOTAL_SUMMONS and user not in FORCED_USER_IDS:
             failures.append(f"user={user} has {total} summons but was classified NEW ({reason})")
-        if allowed and total > NEW_ACCOUNT_TOTAL_SUMMONS and user not in FORCED_USER_IDS:
+        if allowed and classified_at > NEW_ACCOUNT_TOTAL_SUMMONS and user not in FORCED_USER_IDS:
             failures.append(f"user={user} has {total} summons and would still spend {would_spend} Gems")
         target = state.get("targetBatches") or 0
         if target > MAXIMUM_SUMMON_BATCHES:

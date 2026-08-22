@@ -173,49 +173,129 @@ local function isPlayerData(value)
 end
 
 -- The getgc index drifts each session, so resolve by structure rather than index.
-local playerData
+--
+-- Prefer the stable wrapper container over a bare PlayerData table. getgc exposes
+-- both the container and its inner table as separate objects, and a lobby that is
+-- still warming up also holds earlier, detached PlayerData copies that the server
+-- never writes to again. Taking the first direct match is therefore a lottery: on
+-- 11540210243 and 11540219520 it bound a dead table at getgc[510]/getgc[1808]
+-- while the live wrapper sat at getgc[84269]/getgc[86851]. Every remote then
+-- succeeded ("Code Redeemed!", the wheel returned a prize) while our copy stayed
+-- at zero Gems, so the run summoned nothing and reached the stage with no units.
+-- Holding the container also survives the server replacing container.PlayerData
+-- after a purchase or fusion, which is why main.lua and UnitProgression already
+-- resolve this way.
+local playerDataContainer
 local playerDataSource
+local playerDataIsWrapper = false
+local playerDataSettled = false
+
+local function currentPlayerData()
+	if typeof(playerDataContainer) ~= "table" then return nil end
+	local nested = rawget(playerDataContainer, "PlayerData")
+	if isPlayerData(nested) then return nested end
+	if isPlayerData(playerDataContainer) then return playerDataContainer end
+	return nil
+end
+
+-- Returns true when a container was adopted. The whole snapshot is scanned; a
+-- direct table is kept only as a fallback for builds that expose no wrapper.
 local function scanPlayerDataOnce()
-	if isPlayerData(playerData) then return playerData end
 	assert(typeof(getgc) == "function", "FastMode requires getgc(true).")
 	local ok, objects = pcall(getgc, true)
-	if not ok or typeof(objects) ~= "table" then fail("RUNTIME", "getgc(true) failed.") end
+	if not ok or typeof(objects) ~= "table" then return false end
+	local directCandidate, directSource
 	for index, object in ipairs(objects) do
-		if isPlayerData(object) then
-			playerData = object
-			playerDataSource = "getgc[" .. index .. "]"
-			break
-		end
-		if typeof(object) == "table" and isPlayerData(rawget(object, "PlayerData")) then
-			playerData = rawget(object, "PlayerData")
-			playerDataSource = "getgc[" .. index .. "].PlayerData"
-			break
+		if typeof(object) == "table" then
+			if isPlayerData(rawget(object, "PlayerData")) then
+				playerDataContainer = object
+				playerDataSource = "getgc[" .. index .. "].PlayerData"
+				playerDataIsWrapper = true
+				return true
+			end
+			if not directCandidate and isPlayerData(object) then
+				directCandidate = object
+				directSource = "getgc[" .. index .. "]"
+			end
 		end
 	end
-	return playerData
+	if directCandidate then
+		playerDataContainer = directCandidate
+		playerDataSource = directSource
+		playerDataIsWrapper = false
+		return true
+	end
+	return false
 end
 
 -- The first Auto-Execute scan often occurs while critical lobby assets are still
 -- loading. Re-run getgc so newly-created PlayerData tables can actually appear;
 -- sleeping while retaining the first snapshot would never resolve the race.
 local function resolvePlayerData()
-	if isPlayerData(playerData) then return playerData end
+	if playerDataSettled then
+		local cached = currentPlayerData()
+		if cached then return cached end
+		-- The container stopped carrying a valid payload; re-resolve rather than
+		-- reading through a table the server has abandoned.
+		playerDataSettled = false
+		playerDataIsWrapper = false
+	end
 	local timeout = tonumber(Bootstrap.runtimeLoadTimeout) or 60
 	local interval = tonumber(Bootstrap.runtimeDiscoveryInterval) or 0.5
+	-- Keep looking for the wrapper for a bounded grace window before settling for a
+	-- direct table, so a wrapper that replicates a moment later still wins.
+	local grace = math.min(timeout, math.max(0, tonumber(Bootstrap.wrapperGraceTimeout) or 10))
 	local deadline = os.clock() + timeout
+	local graceDeadline = os.clock() + grace
 	log("WAIT", "Waiting for authoritative lobby PlayerData before bootstrap actions.", {
 		timeout = timeout,
 		placeId = game.PlaceId,
 	})
 	repeat
-		if scanPlayerDataOnce() then break end
+		scanPlayerDataOnce()
+		if playerDataIsWrapper then break end
+		if currentPlayerData() and os.clock() >= graceDeadline then break end
 		task.wait(interval)
 	until os.clock() >= deadline
-	if not playerData then
+	local data = currentPlayerData()
+	if not data then
 		fail("RUNTIME", "Live PlayerData was not found before the bounded lobby-load timeout.")
 	end
-	debugLog("RUNTIME", "Resolved authoritative PlayerData.", { source = playerDataSource })
-	return playerData
+	playerDataSettled = true
+	debugLog("RUNTIME", "Resolved authoritative PlayerData.", {
+		source = playerDataSource,
+		wrapper = playerDataIsWrapper,
+	})
+	return data
+end
+
+-- Re-resolve the container and report whether a different one was adopted. Used
+-- only after evidence failed to move, which is the signature of a dead PlayerData
+-- reference rather than a rejected remote: the server answered "Code Redeemed!"
+-- while our table stayed at zero.
+local function rescanPlayerData(reason)
+	local previousData = currentPlayerData()
+	local previousSource = playerDataSource
+	if not scanPlayerDataOnce() then return false end
+	if currentPlayerData() == previousData then return false end
+	playerDataSettled = true
+	log("RUNTIME", "Re-resolved PlayerData; the previous reference was not receiving server writes.", {
+		reason = reason,
+		previousSource = previousSource,
+		source = playerDataSource,
+		wrapper = playerDataIsWrapper,
+	})
+	return true
+end
+
+-- Re-check the same predicate against the re-resolved table before recording the
+-- action as unverified. No remote is fired again, so a delayed success can never
+-- be spent twice.
+local function verifyWithRescan(predicate, timeout)
+	if waitUntil(predicate, timeout) then return true end
+	if not rescanPlayerData("verification evidence never moved") then return false end
+	local ok, result = pcall(predicate)
+	return ok and result == true
 end
 
 local function readGems()
@@ -474,7 +554,7 @@ local function redeemCodes()
 					local ok, response = pcall(codesFunction.InvokeServer, codesFunction, "RedeemCode", code)
 					lastRequestAt = os.clock()
 					local status = classifyRedeemResponse(ok, response)
-					local verified = waitUntil(function()
+					local verified = verifyWithRescan(function()
 						return isCodeRedeemed(code) or readGems() ~= beforeGems
 					end, Bootstrap.claimSettlementTimeout)
 					local afterGems = readGems()
@@ -505,7 +585,7 @@ local function claimDailyReward()
 	local beforeGems = readGems()
 	log("ACTION", "Claim Daily Reward.")
 	remote:FireServer("ClaimDailyReward", tostring(Settings.dailyRewardType or "Normal"))
-	local verified = waitUntil(function()
+	local verified = verifyWithRescan(function()
 		return changedDaily(before, readDailyState(), false) or readGems() ~= beforeGems
 	end, Bootstrap.claimSettlementTimeout)
 	state.claimResults.dailyReward = {
@@ -550,6 +630,18 @@ local function claimPlayTimeRewards()
 	end
 
 	local gemsAfter = readGems()
+	-- Playtime indices settle as one batch, so "not a single one moved" cannot mean
+	-- six independent rejections; it means the table being read is not the live one.
+	local anySettled = false
+	for _, entry in ipairs(pending) do
+		if readPlayTimeState(entry.index).claimed then
+			anySettled = true
+			break
+		end
+	end
+	if not anySettled and rescanPlayerData("no playtime index settled") then
+		gemsAfter = readGems()
+	end
 	for _, entry in ipairs(pending) do
 		local verified = readPlayTimeState(entry.index).claimed
 		state.claimResults.playTimeRewards[tostring(entry.index)] = {
@@ -575,7 +667,7 @@ local function claimBattlepass()
 	local beforeGems = readGems()
 	log("ACTION", "Claim Battlepass " .. season .. " once.")
 	remote:FireServer("ClaimBattlepass", season)
-	local verified = waitUntil(function()
+	local verified = verifyWithRescan(function()
 		local after = readBattlepassState(season)
 		return after.Claimed ~= before.Claimed
 			or after.PremiumClaimed ~= before.PremiumClaimed
@@ -600,7 +692,7 @@ local function spinDailyWheel()
 	local beforeGems = readGems()
 	log("ACTION", "Spin Daily Wheel.")
 	local ok, response = pcall(remote.InvokeServer, remote, true)
-	local verified = waitUntil(function()
+	local verified = verifyWithRescan(function()
 		return changedDaily(before, readDailyState(), true) or readGems() ~= beforeGems
 	end, Bootstrap.claimSettlementTimeout)
 	state.claimResults.dailyWheel = {
@@ -634,7 +726,7 @@ local function claimAllQuests()
 	local beforeGems = readGems()
 	log("ACTION", string.format("Claim All Quests (%d claimable).", before.claimable))
 	remote:FireServer("ClaimAllQuests")
-	local verified = waitUntil(function()
+	local verified = verifyWithRescan(function()
 		return readQuestClaimState().claimable < before.claimable
 	end, Bootstrap.claimSettlementTimeout)
 	local after = readQuestClaimState()
@@ -773,10 +865,27 @@ local function run()
 
 	-- A new account that already finished its bootstrap never re-opens, however many
 	-- Gems it farms afterwards. Only an interrupted bootstrap resumes.
+	--
+	-- The single exception is a completion that accomplished nothing: zero verified
+	-- batches on an account still sitting at zero summons. That is not a finished
+	-- bootstrap, it is the fingerprint of a run whose PlayerData reference was dead --
+	-- every claim recorded "no state change", the Gem budget froze at zero and the
+	-- target was computed as 0/20. Accounts 11540210243 and 11540219520 were sealed
+	-- that way and would otherwise never summon again. Re-opening cannot overspend:
+	-- the budget is recomputed from the Gems the account actually holds.
 	if state.status == "complete" then
-		return claimsOnlyRun("Bootstrap already completed for this account; claiming only.", {
+		local vacuous = (tonumber(state.verifiedBatches) or 0) == 0 and currentTotal == 0
+		if not vacuous then
+			return claimsOnlyRun("Bootstrap already completed for this account; claiming only.", {
+				verifiedBatches = state.verifiedBatches,
+				targetBatches = state.targetBatches,
+			})
+		end
+		log("GATE", "The recorded completion verified no batches and the account still has zero "
+			.. "summons; re-opening the bootstrap instead of sealing it.", {
 			verifiedBatches = state.verifiedBatches,
 			targetBatches = state.targetBatches,
+			totalSummons = currentTotal,
 		})
 	end
 
@@ -878,7 +987,7 @@ local function run()
 			tostring(Settings.summonBanner or "Standard"),
 			tonumber(Settings.summonBatchSize) or 10
 		)
-		local verified = waitUntil(function()
+		local verified = verifyWithRescan(function()
 			return readGems() <= beforeGems - batchCost
 				and readTotalSummons() >= beforeTotal + expectedIncrease
 		end, Bootstrap.verifyTimeout)

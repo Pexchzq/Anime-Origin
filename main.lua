@@ -304,11 +304,18 @@ if typeof(writefile) == "function" then
 	writefile(reportFile, encode(report))
 end
 
+-- Remotes currently attached, keyed by role. Cleared by disconnectAll.
+local boundRemotes = {}
+
 local function disconnectAll()
 	for _, connection in ipairs(controller.connections) do
 		pcall(function() connection:Disconnect() end)
 	end
 	controller.connections = {}
+	-- boundRemotes records what is currently attached, and bindRemote skips any key
+	-- it still believes is bound. Leaving it populated after a teardown would make a
+	-- restarted route run deaf: no MapSelect, no Notification, no generic events.
+	table.clear(boundRemotes)
 end
 
 function controller.stop()
@@ -532,7 +539,6 @@ local mapRemote
 local actRemote
 local genericRemote
 local notificationRemote
-local boundRemotes = {}
 
 local bus = {
 	mapSelectGeneration = 0,
@@ -700,6 +706,9 @@ local function resolveWorkspacePath(path)
 end
 
 local recentPortalFailures = {}
+-- How many times each door refused us this session. A timestamp alone cannot
+-- deprioritise a door for longer than one attempt takes.
+local portalFailureCounts = {}
 
 -- Occupancy must be decided before moving the local character. Every Story Pod
 -- owns an InsideModel, so its live bounding box gives us a per-door signal that
@@ -755,23 +764,52 @@ local function resolvePortalCandidates()
 	local character = player.Character
 	local rootPart = character and character:FindFirstChild("HumanoidRootPart")
 	local now = os.clock()
+	local cooldown = tonumber(Entrance.portalFailureCooldown) or 1
+
+	-- table.sort demands a strict weak ordering, and the previous comparator broke
+	-- it two different ways.
+	--
+	-- 1. `recentPortalFailures[door] and <compare>` evaluates to nil for a door that
+	--    never failed and to false for one whose cooldown has expired. nil ~= false,
+	--    so those two doors each sorted strictly before the other and Luau raised
+	--    "invalid order function for sorting". That is the crash that killed the
+	--    route on 11540209823 once some doors had been tried and aged out while
+	--    others were still untried.
+	-- 2. An epsilon tie-break (|a - b| > 0.01) is not transitive: a ties b and b
+	--    ties c while a and c compare strictly. Quantise onto one integer grid and
+	--    compare exactly instead.
+	--
+	-- Ranks are also precomputed, so a character that walks mid-sort cannot change
+	-- a key underneath table.sort and reintroduce an inconsistent ordering.
+	--
+	-- Failure count leads the ordering because a wall-clock cooldown cannot work
+	-- here: one attempt waits up to occupiedPortalWaitTimeout (20s) for MapSelect,
+	-- four times portalFailureCooldown (5s), so a rejected door was always cool
+	-- again by the next attempt and got picked repeatedly. Ordering by how often a
+	-- door has been refused makes "try a different one" true regardless of timing.
+	local rank = {}
+	for _, door in ipairs(candidates) do
+		local failedAt = recentPortalFailures[door]
+		local position = door.Position
+		rank[door] = {
+			failures = portalFailureCounts[door] or 0,
+			cooling = (failedAt ~= nil and now - failedAt < cooldown) and 1 or 0,
+			distance = rootPart
+				and math.floor((rootPart.Position - position).Magnitude * 100 + 0.5)
+				or 0,
+			-- Position is stable and executor-safe; GetDebugId can require elevated
+			-- identity on some builds and must not be part of the routing path.
+			x = math.floor(position.X * 100 + 0.5),
+			z = math.floor(position.Z * 100 + 0.5),
+		}
+	end
 	table.sort(candidates, function(left, right)
-		local leftCooling = recentPortalFailures[left]
-			and now - recentPortalFailures[left] < (tonumber(Entrance.portalFailureCooldown) or 1)
-		local rightCooling = recentPortalFailures[right]
-			and now - recentPortalFailures[right] < (tonumber(Entrance.portalFailureCooldown) or 1)
-		if leftCooling ~= rightCooling then return not leftCooling end
-		if rootPart then
-			local leftDistance = (rootPart.Position - left.Position).Magnitude
-			local rightDistance = (rootPart.Position - right.Position).Magnitude
-			if math.abs(leftDistance - rightDistance) > 0.01 then return leftDistance < rightDistance end
-		end
-		-- Position is stable and executor-safe; GetDebugId can require elevated
-		-- identity on some builds and must not be part of the routing path.
-		if math.abs(left.Position.X - right.Position.X) > 0.01 then
-			return left.Position.X < right.Position.X
-		end
-		return left.Position.Z < right.Position.Z
+		local a, b = rank[left], rank[right]
+		if a.failures ~= b.failures then return a.failures < b.failures end
+		if a.cooling ~= b.cooling then return a.cooling < b.cooling end
+		if a.distance ~= b.distance then return a.distance < b.distance end
+		if a.x ~= b.x then return a.x < b.x end
+		return a.z < b.z
 	end)
 	return candidates
 end
@@ -873,7 +911,7 @@ local function enterStoryPortal()
 		for index = 1, #portalCandidates do
 			local portal = portalCandidates[index]
 			local failedAt = recentPortalFailures[portal]
-			local cooling = failedAt
+			local cooling = failedAt ~= nil
 				and os.clock() - failedAt < (tonumber(Entrance.portalFailureCooldown) or 1)
 			local occupied, occupant = portalHasOtherPlayer(portal)
 			if not cooling and not occupied then
@@ -898,6 +936,7 @@ local function enterStoryPortal()
 	local entered, entryError = tryEnterStoryPortal(attemptedPortal, deadline)
 	if entered then return true, nil, attemptedPortal end
 	recentPortalFailures[attemptedPortal] = os.clock()
+	portalFailureCounts[attemptedPortal] = (portalFailureCounts[attemptedPortal] or 0) + 1
 	lastError = entryError or lastError
 	log("PORTAL_CANDIDATE", "Selected Story Pod rejected; the next bounded route attempt will use another door.", {
 		portal = attemptedPortal,
@@ -1029,7 +1068,10 @@ local function startSelectedStage(target)
 			end
 			log("VERIFY", "StartTeleport was not confirmed; no blind success recorded.", { attempt = attempt })
 		else
-			if selectedPortal then recentPortalFailures[selectedPortal] = os.clock() end
+			if selectedPortal then
+				recentPortalFailures[selectedPortal] = os.clock()
+				portalFailureCounts[selectedPortal] = (portalFailureCounts[selectedPortal] or 0) + 1
+			end
 			log("VERIFY", "StartSelection was not confirmed by matching AfterMapSelect.", { attempt = attempt })
 		end
 		if attempt < (tonumber(Settings.maximumTransitionAttempts) or 2) then
@@ -1480,21 +1522,53 @@ local function run()
 	end
 end
 
+-- The Loader starts each controller exactly once with task.spawn + pcall, so any
+-- error inside the route used to end the whole session: main.lua raised FATAL and
+-- nothing routed again until the account was rejoined. AutoPlay already runs under
+-- a supervisor; this closes the same gap for the route that feeds it.
 task.spawn(function()
-	local ok, result = xpcall(run, function(message)
+	local function traceback(message)
 		return debug and debug.traceback and debug.traceback(tostring(message), 2) or tostring(message)
-	end)
-	if not ok and controller.active then
-		report.status = "FAILED"
+	end
+	local maximumRestarts = math.max(0, math.floor(tonumber(Settings.maximumRouteRestarts) or 3))
+	local restartDelay = math.max(0, tonumber(Settings.routeRestartDelay) or 5)
+
+	for attempt = 0, maximumRestarts do
+		local ok, result = xpcall(run, traceback)
+		if ok then
+			if controller.active and report.context == "LOBBY"
+				and report.status ~= "TELEPORTING_TO_STAGE" then
+				report.status = "COMPLETE"
+				saveReport("lobby run complete")
+			end
+			return
+		end
+		if not controller.active then return end
+		-- A teleport already committed this place lifecycle. The Loader rebuilds every
+		-- controller against the new runtime, so restarting here would race it.
+		if report.status == "TELEPORTING_TO_STAGE" then return end
+
 		report.error = result
-		log("FATAL", "Main route stopped.", { trace = result })
-		-- The report remains FAILED (not STOPPED) while all event listeners are
-		-- disconnected so no partial controller continues acting in the background.
-		controller.active = false
+		if attempt >= maximumRestarts then
+			report.status = "FAILED"
+			log("FATAL", "Main route stopped.", { trace = result, restarts = attempt })
+			-- The report remains FAILED (not STOPPED) while all event listeners are
+			-- disconnected so no partial controller continues acting in the background.
+			controller.active = false
+			disconnectAll()
+			return
+		end
+
+		report.status = "RESTARTING"
+		report.routeRestarts = attempt + 1
+		log("SUPERVISOR", "Main route stopped on an error; restarting the route.", {
+			attempt = attempt + 1,
+			maximumRestarts = maximumRestarts,
+			trace = result,
+		})
+		saveReport("supervised route restart")
 		disconnectAll()
-	elseif controller.active and report.context == "LOBBY" and report.status ~= "TELEPORTING_TO_STAGE" then
-		report.status = "COMPLETE"
-		saveReport("lobby run complete")
+		task.wait(restartDelay)
 	end
 end)
 

@@ -73,6 +73,12 @@ local Config = {
 			-- Refresh getgc during this window instead of failing on the first scan.
 			runtimeLoadTimeout = 60,
 			runtimeDiscoveryInterval = 0.5,
+			-- getgc exposes both the PlayerData wrapper and its inner table, plus any
+			-- detached warm-up copies. Only the wrapper keeps receiving server writes, so
+			-- keep looking for it for this long before settling for a bare table; binding
+			-- a dead copy makes every claim report "no state change" while the server is
+			-- actually crediting the account.
+			wrapperGraceTimeout = 10,
 			-- When the gate is exactly zero, every current Gem may fund this bootstrap,
 			-- even if that Gem did not come from a reward claimed in the same run.
 			spendAllAvailableGems = true,
@@ -157,6 +163,11 @@ local Config = {
 		-- already contain another player or an active party, so main.lua rotates to
 		-- another verified Pod instead of retrying the first DoorUIPart forever.
 		maximumTransitionAttempts = 6,
+		-- A route error used to end the session outright, because the Loader starts
+		-- main.lua exactly once with task.spawn + pcall. Restart the route a bounded
+		-- number of times instead; listeners are torn down and re-bound each time.
+		maximumRouteRestarts = 3,
+		routeRestartDelay = 5,
 		-- A live match replicates a wave or lifecycle event every few seconds. When
 		-- the server goes quiet the stage monitor used to keep writing heartbeats
 		-- forever: one captured session sat at Wave 6 for eleven minutes with both
@@ -252,6 +263,14 @@ local Config = {
 		dryRun = false,
 		statePollInterval = 0.1,
 		verifyTimeout = 8,
+		-- This file takes one getgc snapshot at attach time and turns any missing
+		-- definition into a fatal error. The Loader starts it the instant the place
+		-- teleport finishes, so that snapshot regularly predates the lobby's modules.
+		-- Keep re-taking it until it is plausibly sized and actually carries the level
+		-- formula and a PlayerData container.
+		runtimeLoadTimeout = 60,
+		runtimeDiscoveryInterval = 0.5,
+		minimumGCSnapshotSize = 1000,
 		-- Every request is already verified from PlayerData; this delay only yields
 		-- briefly to replication instead of idling a third of a second per action.
 		actionDelay = 0.05,
