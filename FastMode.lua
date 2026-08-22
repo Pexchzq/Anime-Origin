@@ -769,9 +769,17 @@ local function run()
 		local autoSellReady = waitUntil(configuredAutoSellReady,
 			(Config.inGameSettings and tonumber(Config.inGameSettings.verifyTimeout) or 5) + 3)
 		if not autoSellReady then
-			fail("AUTO_SELL", "Configured PlayerData.AutoSell state is not ready; run InGameSettings.lua in the lobby.")
+			-- AutoSell only controls disposal of low-rarity pulls. Some executors can
+			-- send its remote but cannot observe the replaced PlayerData table, so it
+			-- must never block the summon that creates a fresh account's first team.
+			state.autoSellVerificationDegraded = true
+			saveState(state, "autosell_unverified_summons_continue")
+			log("AUTO_SELL_WARNING", "AutoSell was not verified; summon batches will continue.")
+		else
+			state.autoSellVerificationDegraded = nil
+			saveState(state, "autosell_verified_before_summons")
+			log("VERIFY", "Configured Auto Sell state is authoritative and ready.")
 		end
-		log("VERIFY", "Configured Auto Sell state is authoritative and ready.")
 	end
 	local summonFunction = ReplicatedStorage:WaitForChild("LobbyRemotes"):WaitForChild("SummonFunction")
 	log("STEP", string.format("[3/4] Summoning verified batches %d/%d.", state.verifiedBatches, targetBatches))

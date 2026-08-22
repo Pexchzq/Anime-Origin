@@ -76,6 +76,7 @@ local report = {
 	actions = {},
 	candidates = {},
 	unresolved = {},
+	warnings = {},
 }
 local controller = {
 	stopRequested = false,
@@ -152,14 +153,21 @@ local function isPlayerData(value)
 end
 
 local function resolvePlayerData(refresh)
+	local directCandidate, directSource
+	-- Prefer a stable wrapper whose PlayerData field can be replaced by the
+	-- server. Old direct PlayerData tables remain in getgc on some executors and
+	-- made a successful AutoSell toggle look unchanged forever.
 	for index, object in ipairs(getGCObjects(refresh)) do
 		if typeof(object) == "table" then
-			if isPlayerData(object) then return object, "getgc[" .. index .. "]" end
 			local nested = rawget(object, "PlayerData")
 			if isPlayerData(nested) then return nested, "getgc[" .. index .. "].PlayerData" end
+			if not directCandidate and isPlayerData(object) then
+				directCandidate = object
+				directSource = "getgc[" .. index .. "]"
+			end
 		end
 	end
-	return nil, nil
+	return directCandidate, directSource
 end
 
 local function simpleValue(value)
@@ -307,8 +315,8 @@ end
 -- a new account with the option disabled omits AutoSell/banner/rarity entirely.
 -- Therefore a missing key under an authoritative PlayerData table means false;
 -- malformed non-table values remain unresolved and never trigger a blind toggle.
-local function currentAutoSell(banner, rarity)
-	local playerData, source = resolvePlayerData()
+local function currentAutoSell(banner, rarity, refresh)
+	local playerData, source = resolvePlayerData(refresh)
 	if typeof(playerData) ~= "table" then return nil, source, false end
 	local baseSource = tostring(source or "<PlayerData>") .. ".AutoSell"
 	local autoSell = rawget(playerData, "AutoSell")
@@ -322,6 +330,34 @@ local function currentAutoSell(banner, rarity)
 	local raritySource = bannerSource .. "[" .. string.format("%q", rarity) .. "]"
 	if rawValue == nil then return false, raritySource .. " (sparse default)", true end
 	return normalizeBoolean(rawValue), raritySource, true
+end
+
+-- A toggle remote must never be fired twice merely because an executor exposes
+-- a stale cache: the second call could undo the first. Continue observing fresh
+-- getgc snapshots in the background and upgrade the report if evidence arrives.
+local function observeAutoSellLate(banner, rarity, desired, actionRecord, unresolvedKey)
+	task.spawn(function()
+		local deadline = os.clock() + math.max(15, verifyTimeout * 3)
+		repeat
+			local after, afterSource = currentAutoSell(banner, rarity, true)
+			if after == desired then
+				actionRecord.after = after
+				actionRecord.source = afterSource
+				actionRecord.verified = true
+				actionRecord.verifiedLate = true
+				for index = #report.unresolved, 1, -1 do
+					if report.unresolved[index].key == unresolvedKey then
+						table.remove(report.unresolved, index)
+					end
+				end
+				log("VERIFY_LATE", "Auto Sell " .. banner .. "." .. rarity
+					.. " was confirmed by a refreshed PlayerData snapshot.", { source = afterSource })
+				saveReport("Late AutoSell verification")
+				return
+			end
+			task.wait(pollInterval)
+		until os.clock() >= deadline or controller.stopRequested
+	end)
 end
 
 local function syncAutoSell()
@@ -374,11 +410,11 @@ local function syncAutoSell()
 				local deadline = os.clock() + verifyTimeout
 				local verified, after, afterSource = false, nil, source
 				repeat
-					after, afterSource = currentAutoSell(banner, rarity)
+					after, afterSource = currentAutoSell(banner, rarity, true)
 					verified = after == desired
 					if not verified then task.wait(pollInterval) end
 				until verified or os.clock() >= deadline
-				table.insert(report.actions, {
+				local actionRecord = {
 					key = "AutoSell." .. banner .. "." .. rarity,
 					type = "toggle",
 					before = before,
@@ -387,13 +423,30 @@ local function syncAutoSell()
 					after = after,
 					source = afterSource,
 					verified = verified,
-				})
-				if not verified then fail("VERIFY", "AutoSell " .. banner .. "." .. rarity .. " did not become " .. tostring(desired) .. ".") end
+				}
+				table.insert(report.actions, actionRecord)
+				if not verified then
+					local unresolvedKey = "AutoSell." .. banner .. "." .. rarity
+					table.insert(report.unresolved, {
+						key = unresolvedKey,
+						reason = "Toggle was sent once but refreshed PlayerData did not confirm it",
+						source = afterSource,
+					})
+					table.insert(report.warnings,
+						"AutoSell verification is degraded for " .. banner .. "." .. rarity)
+					log("DEGRADED", "AutoSell verification is degraded; background retry will continue.", {
+						banner = banner,
+						rarity = rarity,
+						desired = desired,
+					})
+					observeAutoSellLate(banner, rarity, desired, actionRecord, unresolvedKey)
+				else
 				-- Make the authoritative post-remote transition visible in both console
 				-- and the persisted log so FastMode dependency failures are easy to audit.
-				log("VERIFY", "Auto Sell " .. banner .. "." .. rarity .. " confirmed as " .. tostring(desired) .. ".", {
-					source = afterSource,
-				})
+					log("VERIFY", "Auto Sell " .. banner .. "." .. rarity .. " confirmed as " .. tostring(desired) .. ".", {
+						source = afterSource,
+					})
+				end
 			end
 		end
 	end

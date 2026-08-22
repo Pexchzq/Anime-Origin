@@ -556,7 +556,26 @@ end
 local ranking, allDamageCopies = rankOwnedDamage()
 local targetLimit = math.max(1, math.floor(tonumber(Settings.maximumRankedTargets) or 6))
 while #ranking > targetLimit do table.remove(ranking) end
-if #ranking == 0 then fail("RANK", "No eligible damage unit could be ranked.") end
+if #ranking == 0 then
+	-- A brand-new account can reach this worker before it owns a compatible
+	-- damage unit. This is an empty-work pass, not a pipeline failure; FastMode
+	-- can summon units and the next lobby lifecycle will rank them normally.
+	report.status = "SKIPPED_NO_ELIGIBLE_DAMAGE"
+	report.warnings = { "No eligible damage unit was available; progression was skipped." }
+	log("SKIP", "No eligible damage unit was available; progression was skipped.")
+	saveReport(report.status)
+	publishLifecycle("COMPLETE", {
+		reportStatus = report.status,
+		skipped = true,
+		reason = "empty eligible damage inventory",
+		reportFile = reportFile,
+	})
+	if environment.AnimeOriginUnitProgressionRunning == runToken then
+		environment.AnimeOriginUnitProgressionRunning = nil
+	end
+	environment.AnimeOriginUnitProgressionReport = report
+	return report
+end
 
 local function publicUnit(unit, rank)
 	return {
