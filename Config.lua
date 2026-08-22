@@ -49,7 +49,7 @@ local Config = {
 		bootstrap = {
 			newAccountTotalSummons = 0,
 			expectedSummonsPerBatch = 10,
-			maximumSummonBatches = 10,
+			maximumSummonBatches = 20,
 			summonBatchCost = 500,
 			verifyTimeout = 10,
 			-- Faster polling is safe because every mutation still requires PlayerData
@@ -230,7 +230,7 @@ local Config = {
 		verifyTimeout = 8,
 		-- Every request is already verified from PlayerData; this delay only yields
 		-- briefly to replication instead of idling a third of a second per action.
-		actionDelay = 0.1,
+		actionDelay = 0.05,
 		maximumFuseRequestsPerRun = 60,
 		maximumFeedRequestsPerRun = 120,
 		primaryCohortSize = 3,
