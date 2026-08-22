@@ -186,10 +186,43 @@ local function getGCObjects(refresh)
 	if gcObjects and refresh ~= true then return gcObjects end
 	if refresh == true then releaseGCObjects() end
 	assert(typeof(getgc) == "function", "getgc is unavailable.")
-	local ok, objects = pcall(getgc, true)
-	assert(ok and typeof(objects) == "table", "getgc(true) failed.")
-	gcObjects = objects
-	return objects
+
+	-- An empty table satisfies typeof(objects) == "table", so a snapshot taken while
+	-- a transition is tearing the VM down used to be handed to callers as data. It
+	-- is not data; it is a failed read. Retry until the snapshot is plausible, and
+	-- keep the largest attempt so callers never see a degenerate one by preference.
+	local minimum = math.max(0, tonumber(Settings.minimumGCSnapshotSize) or 1000)
+	local attempts = math.max(1, math.floor(tonumber(Settings.gcSnapshotAttempts) or 6))
+	local retryDelay = math.max(0, tonumber(Settings.gcSnapshotRetryDelay) or 0.75)
+
+	local best, bestCount = nil, -1
+	for attempt = 1, attempts do
+		local ok, objects = pcall(getgc, true)
+		if ok and typeof(objects) == "table" then
+			local count = #objects
+			if count >= minimum then
+				if best then table.clear(best) end
+				gcObjects = objects
+				return objects
+			end
+			if count > bestCount then
+				if best then table.clear(best) end
+				best, bestCount = objects, count
+			else
+				table.clear(objects)
+			end
+			log("RUNTIME", "getgc(true) returned an implausibly small snapshot; retrying.", {
+				attempt = attempt,
+				objects = count,
+				minimum = minimum,
+			})
+		end
+		if attempt < attempts then task.wait(retryDelay) end
+	end
+
+	assert(bestCount >= 0, "getgc(true) failed.")
+	gcObjects = best
+	return best
 end
 
 local function isPlayerData(value)
@@ -700,6 +733,9 @@ local function disconnectAll(connections)
 	for _, connection in ipairs(connections) do
 		pcall(function() connection:Disconnect() end)
 	end
+	-- Clearing matters once the table survives a supervised restart: leaving dead
+	-- entries behind would stack a new listener generation on top of the old one.
+	table.clear(connections)
 end
 
 -- MatchRuntime is stable by shape even though its getgc index changes on every
@@ -1479,6 +1515,9 @@ local function upgradeTower(towerFunction, observer, matchRuntime, tower, uuid, 
 	return false, "not-confirmed", nil
 end
 
+-- Survives a supervised restart so every listener generation can be disconnected.
+local monitorConnections = {}
+
 local function run()
 	-- AutoPlay owns the stage lifecycle. On the confirmed lobby place it must stay
 	-- idle rather than treating the intentional absence of MatchRuntime as an error;
@@ -1496,7 +1535,11 @@ local function run()
 	local inventoryRemote = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("InventoryRemotes"):WaitForChild("InventoryRemote")
 	local requiredDamage = tonumber(Settings.minimumDamageSlots) or 3
 	local expectedDesired = {}
-	local connections = {}
+	-- Owned by the supervisor rather than by this call. run() that errors never
+	-- reaches its own disconnectAll, so the listeners it attached stay live; a
+	-- restart must clear that previous generation before attaching its own.
+	disconnectAll(monitorConnections)
+	local connections = monitorConnections
 
 	-- Ranking is reusable when the script starts in the middle of a match: the
 	-- desired team can be read without mutating EquippedTowers until pre-match.
@@ -1509,6 +1552,18 @@ local function run()
 		})
 
 		local definitions, sources, unresolved = resolveDefinitions(towers)
+		if #unresolved > 0 then
+			-- Losing every definition at once is the signature of a bad snapshot, not
+			-- of missing content: a unit the game actually added would leave the other
+			-- nine resolved. Rescan from a fresh snapshot before believing it.
+			log("RETRY", "Definitions incomplete on the first snapshot; rescanning.", {
+				unresolved = unresolved,
+				owned = countEntries(towers),
+			})
+			releaseGCObjects()
+			task.wait(math.max(0, tonumber(Settings.definitionRetryDelay) or 1))
+			definitions, sources, unresolved = resolveDefinitions(towers)
+		end
 		report.unresolvedDefinitions = unresolved
 		if #unresolved > 0 then fail("DEFINITIONS", "Missing StageStats for: " .. table.concat(unresolved, ", ")) end
 
@@ -2503,9 +2558,44 @@ local function run()
 	return report
 end
 
-local ok, result = xpcall(run, function(message)
+-- The Loader starts every controller exactly once with task.spawn+pcall, so an
+-- AutoPlay that errors is gone until the next place teleport. There are a dozen
+-- fail() sites here, and each one is reachable from a transient runtime condition
+-- -- a torn-down VM mid-transition, a remote that has not replicated yet. Losing
+-- the rest of the session to any of them is a supervision gap, not twelve separate
+-- bugs: one captured run died on a bad getgc snapshot and left Main monitoring an
+-- unplayed match for 49 minutes. Restart the monitor instead, bounded, with every
+-- previous listener disconnected first.
+local maximumRestarts = math.max(0, math.floor(tonumber(Settings.maximumMonitorRestarts) or 5))
+local restartDelay = math.max(0, tonumber(Settings.monitorRestartDelay) or 3)
+local traceback = function(message)
 	return debug and debug.traceback and debug.traceback(tostring(message), 2) or tostring(message)
-end)
+end
+
+local ok, result
+for attempt = 0, maximumRestarts do
+	ok, result = xpcall(run, traceback)
+	if ok or controller.stopRequested then break end
+	if attempt >= maximumRestarts then
+		log("SUPERVISOR", "Restart budget exhausted; AutoPlay is stopping for this session.", {
+			restarts = attempt,
+			maximumMonitorRestarts = maximumRestarts,
+		})
+		break
+	end
+	report.status = "RESTARTING"
+	report.error = result
+	report.monitorRestarts = attempt + 1
+	log("SUPERVISOR", "AutoPlay stopped on a runtime error; restarting the monitor.", {
+		restart = attempt + 1,
+		maximumMonitorRestarts = maximumRestarts,
+		error = tostring(result):match("^[^\n]*"),
+	})
+	saveReport("supervised restart")
+	disconnectAll(monitorConnections)
+	releaseGCObjects()
+	task.wait(restartDelay)
+end
 if environment.AnimeOriginAutoPlayRunning == runToken then
 	environment.AnimeOriginAutoPlayRunning = nil
 end

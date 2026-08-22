@@ -440,6 +440,27 @@ local Config = {
 		-- A false UpgradeTower response is authoritative for that placed UUID.
 		-- Back it off instead of hammering the same stale/rejected target every frame.
 		upgradeRejectionCooldown = 8,
+		-- getgc(true) called while a place or act transition is tearing the Lua VM
+		-- down returns an empty or near-empty table. That is a failed snapshot, not
+		-- proof the game holds no data -- but an empty table still satisfies
+		-- typeof(x) == "table", so it used to reach callers as fact. One captured run
+		-- shows the cost precisely: 28 definition scans took 0.095-0.295s each, the
+		-- 29th finished in 0.022s having found none of the ten owned units, and
+		-- AutoPlay died for the remaining 49 minutes of the session. Reject a
+		-- snapshot smaller than this and retry instead of believing it.
+		minimumGCSnapshotSize = 1000,
+		gcSnapshotAttempts = 6,
+		gcSnapshotRetryDelay = 0.75,
+		-- Rescan from a fresh snapshot before treating missing StageStats as a real
+		-- content problem. A genuinely unknown unit stays unresolved after the
+		-- rescan; a transition-window snapshot does not.
+		definitionRetryDelay = 1,
+		-- The Loader starts each controller exactly once with task.spawn+pcall, so a
+		-- controller that errors is gone until the next teleport -- which is how a
+		-- single transient failure cost a whole session. Restart the monitor this
+		-- many times, disconnecting every listener first so restarts cannot stack.
+		maximumMonitorRestarts = 5,
+		monitorRestartDelay = 3,
 		-- AutoPlay attaches shortly after StartWaveVote in normal use. Keep only a
 		-- short event-listener settle period before deciding whether the vote is live.
 		voteAttachSettleDelay = 0.15,

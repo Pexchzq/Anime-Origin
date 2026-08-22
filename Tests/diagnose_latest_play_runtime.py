@@ -115,6 +115,42 @@ def check_afford_stall(account: Account, out: list[Finding]) -> None:
                            {"longestRun": longest_run}))
 
 
+WORKER_ABANDONED_MINUTES = 5
+
+
+def check_worker_outlived(account: Account, out: list[Finding]) -> None:
+    """One controller died while the others kept writing.
+
+    The Loader starts each file once with task.spawn+pcall, so a controller that
+    errors is gone for the session while its siblings carry on. On disk that shows
+    up as one artifact frozen minutes behind the others -- the cheapest possible
+    detector for a whole family of silent stalls.
+    """
+    stamps = {}
+    for prefix in ("AutoPlay", "MainRoute"):
+        path = account.path(f"{prefix}_{account.user}_latest.log")
+        if path.exists():
+            stamps[prefix] = path.stat().st_mtime
+    if len(stamps) < 2:
+        return
+
+    newest_name = max(stamps, key=lambda k: stamps[k])
+    for name, stamp in stamps.items():
+        if name == newest_name:
+            continue
+        behind = (stamps[newest_name] - stamp) / 60.0
+        if behind < WORKER_ABANDONED_MINUTES:
+            continue
+        lines = account.log(name)
+        last = lines[-1] if lines else None
+        out.append(Finding("RED", "WORKER_ABANDONED", account.user,
+                           f"{name} stopped writing {behind:.0f} min before {newest_name} did; "
+                           f"it died while the rest of the session kept running.",
+                           {"stoppedBehindMinutes": round(behind, 1),
+                            "lastTag": last.tag if last else None,
+                            "lastMessage": (last.message[:160] if last else None)}))
+
+
 def check_vote_window(account: Account, out: list[Finding]) -> None:
     """AutoPlay parked on the unit-selection screen waiting for a StartWaveVote."""
     lines = account.log("AutoPlay")
@@ -180,6 +216,7 @@ def main() -> int:
         check_locked_slot_probes(account, findings)
         check_afford_stall(account, findings)
         check_vote_window(account, findings)
+        check_worker_outlived(account, findings)
         check_match_progress(account, findings)
 
     return report("PLAY RUNTIME", findings, accounts)
