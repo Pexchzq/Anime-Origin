@@ -1391,10 +1391,71 @@ local function runStage()
 
 	-- This task intentionally stays armed across Replay/Next lifecycles. AutoPlay
 	-- independently re-resolves MatchRuntime and handles team/combat state.
+	--
+	-- Only log() advances `sequence`, and the heartbeat below never logs, so a
+	-- frozen sequence means the server replicated nothing at all: no wave, no act
+	-- event, no verified action. Without this watchdog the loop kept writing
+	-- heartbeats through a dead match and burned the rest of the session.
+	local stallTimeout = math.max(0, tonumber(Settings.stageStallTimeout) or 180)
+	local maximumRecoveries = math.max(0, tonumber(Settings.maximumStallRecoveries) or 3)
+	local lastProgressAt = os.clock()
+	local lastSequence = sequence
+	local stallRecoveries = 0
+
 	while controller.active do
 		task.wait(1)
 		report.currentStage = serializable(currentTarget())
 		report.currentWave = bus.currentWave
+
+		if sequence ~= lastSequence then
+			lastSequence = sequence
+			lastProgressAt = os.clock()
+			report.stalled = nil
+		end
+
+		local quietFor = os.clock() - lastProgressAt
+		if stallTimeout > 0 and quietFor >= stallTimeout then
+			report.stalled = {
+				quietSeconds = math.floor(quietFor),
+				wave = bus.currentWave,
+				matchEpoch = state.matchEpoch,
+				recoveries = stallRecoveries,
+			}
+			log("STALL", string.format(
+				"No replicated stage event for %ds; the match is not progressing.",
+				math.floor(quietFor)), report.stalled)
+
+			if stallRecoveries >= maximumRecoveries then
+				report.status = "STALLED"
+				log("STALL", "Stall recovery budget is exhausted; leaving a STALLED report for diagnosis.", {
+					recoveries = stallRecoveries,
+					maximumStallRecoveries = maximumRecoveries,
+				})
+				saveReport("stage stalled beyond recovery budget", true)
+				return
+			end
+
+			stallRecoveries += 1
+			-- returnToLobby() calls fail() when the remote never binds, and a stalled
+			-- stage is exactly when that is most likely. Killing Main here would only
+			-- trade a silent hang for a silent death, so recover instead of failing.
+			local ok, recovered = pcall(returnToLobby,
+				string.format("stage stalled for %ds", math.floor(quietFor)))
+			if ok and recovered then
+				log("STALL", "Stall recovered through the verified lobby return.", {
+					recoveries = stallRecoveries,
+				})
+				return
+			end
+			log("STALL", "Stall recovery did not confirm a lobby return; re-arming the watchdog.", {
+				recoveries = stallRecoveries,
+				error = (not ok) and tostring(recovered) or nil,
+			})
+			-- The STALL lines above advanced `sequence` themselves; they are not progress.
+			lastProgressAt = os.clock()
+			lastSequence = sequence
+		end
+
 		saveReport("stage heartbeat")
 	end
 end

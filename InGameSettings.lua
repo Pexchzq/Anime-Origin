@@ -612,7 +612,22 @@ local function run()
 				source = afterSource,
 				verified = verified,
 			})
-			if not verified then fail("VERIFY", key .. " did not become " .. tostring(desired) .. ".") end
+			if not verified then
+				-- Toggles are applied in alphabetical order, so killing the controller
+				-- on the first slow replication silently skipped every later key and
+				-- the whole GameSpeed block. Degrade the way the GameSpeed path already
+				-- does: record it as unresolved, report PARTIAL, and keep applying.
+				table.insert(report.unresolved, {
+					key = key,
+					reason = string.format(
+						"SetSetting was fired but %s did not become %s within %ss",
+						key, tostring(desired), tostring(verifyTimeout)),
+					source = afterSource,
+				})
+				log("UNRESOLVED", key .. " did not become " .. tostring(desired)
+					.. "; continuing with the remaining settings.",
+					{ after = after, source = afterSource })
+			end
 		end
 	end
 
@@ -639,7 +654,20 @@ local function run()
 				source = afterSource,
 				verified = verified,
 			})
-			if not verified then fail("VERIFY", key .. " did not become " .. tostring(desired) .. ".") end
+			if not verified then
+				-- Same degrade path as the toggle loop above: one unconfirmed value
+				-- must not cost the run every remaining setting.
+				table.insert(report.unresolved, {
+					key = key,
+					reason = string.format(
+						"SetSetting was fired but %s did not become %s within %ss",
+						key, tostring(desired), tostring(verifyTimeout)),
+					source = afterSource,
+				})
+				log("UNRESOLVED", key .. " did not become " .. tostring(desired)
+					.. "; continuing with the remaining settings.",
+					{ after = after, source = afterSource })
+			end
 		end
 	end
 

@@ -144,6 +144,17 @@ local Config = {
 		-- already contain another player or an active party, so main.lua rotates to
 		-- another verified Pod instead of retrying the first DoorUIPart forever.
 		maximumTransitionAttempts = 6,
+		-- A live match replicates a wave or lifecycle event every few seconds. When
+		-- the server goes quiet the stage monitor used to keep writing heartbeats
+		-- forever: one captured session sat at Wave 6 for eleven minutes with both
+		-- Main and AutoPlay still reporting MONITORING. After this many seconds
+		-- without any replicated event, main returns to the lobby through the normal
+		-- verified transition so the route can restart. Set 0 to disable.
+		stageStallTimeout = 180,
+		-- A stall that survives repeated recoveries is an environment problem, not a
+		-- transient one. Main stops re-teleporting after this many attempts and
+		-- leaves a STALLED report for the diagnose_* tools instead of looping.
+		maximumStallRecoveries = 3,
 		-- Set true to print and persist the chosen route without moving the character
 		-- or sending progression remotes. Normal operation requires false.
 		dryRun = false,

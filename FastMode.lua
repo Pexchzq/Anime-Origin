@@ -699,26 +699,56 @@ local function run()
 	-- bootstrap, so an existing account can redeem a newly-added code or collect a
 	-- currently available Daily/Playtime/Battlepass/Wheel reward without spending.
 	if not resumable and currentTotal ~= newAccountValue then
-		log("GATE", "Existing account detected; running claims only and disabling summons.", {
+		-- An existing account is not a new account, but it still accumulates Gems from
+		-- farming, newly added codes, and today's rewards. Ending the run here used to
+		-- strand every one of them: FastMode is the only module in the project that
+		-- spends Gems, so once this branch was taken the account could never summon
+		-- again. Claim first, then re-evaluate the budget against the real balance.
+		log("GATE", "Existing account detected; claiming rewards before re-evaluating the summon budget.", {
 			totalSummons = currentTotal,
 			expectedNewAccountValue = newAccountValue,
 		})
 		state.lastClaimsOnlyStartedAt = os.time()
+		state.claimResults = state.claimResults or { codes = {}, playTimeRewards = {} }
 		saveState(state, "existing_account_claims_started")
 		log("STEP", "[2/4] Claiming every currently available free reward...")
 		redeemCodes()
 		claimConfiguredRewards()
 		state.lastClaimsOnlyCompletedAt = os.time()
-		saveState(state, "existing_account_claims_complete_no_summons")
-		log("STEP", string.format("[4/4] DONE claims only | Gems=%d | TotalSummons=%d | no summons.",
-			readGems(), readTotalSummons()))
-		return {
-			status = "CLAIMS_ONLY_COMPLETE",
-			gems = readGems(),
-			totalSummons = readTotalSummons(),
-			stateFile = stateFile,
-			logFile = logFile,
-		}
+
+		local claimBatchCost = math.max(1, tonumber(Bootstrap.summonBatchCost) or 500)
+		local claimMaximum = math.max(0, math.floor(tonumber(Bootstrap.maximumSummonBatches) or 10))
+		local gemsAfterClaims = readGems()
+		local affordable = math.min(math.floor(gemsAfterClaims / claimBatchCost), claimMaximum)
+
+		if Bootstrap.spendAllAvailableGems ~= true or affordable < 1 then
+			saveState(state, "existing_account_claims_complete_no_summons")
+			log("STEP", string.format("[4/4] DONE claims only | Gems=%d | TotalSummons=%d | no summons.",
+				gemsAfterClaims, readTotalSummons()))
+			return {
+				status = "CLAIMS_ONLY_COMPLETE",
+				gems = gemsAfterClaims,
+				totalSummons = readTotalSummons(),
+				stateFile = stateFile,
+				logFile = logFile,
+			}
+		end
+
+		-- Enough for at least one ten-pull. Open a fresh summon budget for this run and
+		-- fall through to the normal summon loop instead of returning.
+		state.bootstrapStarted = true
+		state.startedAt = os.time()
+		state.startTotalSummons = readTotalSummons()
+		state.verifiedBatches = 0
+		state.gemsAfterClaims = gemsAfterClaims
+		state.targetBatches = affordable
+		state.status = "summoning"
+		saveState(state, "existing_account_summon_budget_opened")
+		log("BUDGET", string.format("Gems=%d | ten-pull target=%d/%d for this existing account.",
+			gemsAfterClaims, affordable, claimMaximum))
+		-- The budget is now persisted, so the blocks below must treat this run the
+		-- same way they treat a resumed bootstrap: no re-claiming, no target reset.
+		resumable = true
 	end
 
 	if not resumable then
@@ -764,6 +794,10 @@ local function run()
 
 	local batchCost = math.max(1, tonumber(Bootstrap.summonBatchCost) or 500)
 	local targetBatches = math.max(0, math.floor(tonumber(state.targetBatches) or 0))
+	-- Set when a batch cannot be proven. The summon phase stops, but the run stays
+	-- terminal and non-fatal so InGameSettings, UnitProgression and routing still
+	-- happen; the next run reconciles from the authoritative TotalSummons.
+	local summonWarning = nil
 	if state.verifiedBatches < targetBatches then
 		log("WAIT", "Waiting for configured Auto Sell state before the first remaining summon batch.")
 		local autoSellReady = waitUntil(configuredAutoSellReady,
@@ -822,6 +856,13 @@ local function run()
 		local afterGems = readGems()
 		local afterTotal = readTotalSummons()
 		if not verified then
+			-- The dual-proof window can expire on a batch that merely settled late.
+			-- TotalSummons stays authoritative either way, so reconcile against it
+			-- before deciding anything: a landed batch is counted here instead of
+			-- being re-fired and paid for twice on the next run.
+			local settled = math.floor(
+				math.max(0, afterTotal - (tonumber(state.startTotalSummons) or 0)) / expectedIncrease)
+			state.verifiedBatches = math.max(tonumber(state.verifiedBatches) or 0, settled)
 			state.uncertainBatch = {
 				batchNumber = batchNumber,
 				invokeSucceeded = ok,
@@ -830,10 +871,21 @@ local function run()
 				gemsAfter = afterGems,
 				totalSummonsBefore = beforeTotal,
 				totalSummonsAfter = afterTotal,
+				reconciledBatches = state.verifiedBatches,
 			}
 			state.pendingBatch = nil
+			summonWarning = string.format(
+				"batch %d was not proven within %ss; summons stopped for this run",
+				batchNumber, tostring(Bootstrap.verifyTimeout))
 			saveState(state, "unverified_batch_stopped_without_retry")
-			fail("SUMMON", "Server result was not proven by both Gems and TotalSummons; rerun to reconcile safely.")
+			-- Never re-fire an unproven batch inside the same run: the server may have
+			-- taken the Gems already. Stopping the summon phase is enough to stay safe.
+			-- Killing the controller here was not -- it also cost the account every
+			-- later worker, because main treats a failed FastMode as a fatal route gate.
+			log("UNCERTAIN", "Server result was not proven by both Gems and TotalSummons; "
+				.. "summons stopped for this run and left to reconcile on the next run.",
+				state.uncertainBatch)
+			break
 		end
 
 		local reconciled = math.floor(math.max(0, afterTotal - (tonumber(state.startTotalSummons) or 0)) / expectedIncrease)
@@ -846,17 +898,22 @@ local function run()
 		lockConfiguredUnits("summon batch " .. tostring(batchNumber), beforeTowerUUIDs)
 	end
 
-	state.status = "complete"
+	-- Only a run that proved every batch may mark the state complete. Leaving it
+	-- unfinished is what lets the next run resume and spend the remaining Gems.
+	state.status = summonWarning == nil and "complete" or "summons_incomplete"
 	state.completedAt = os.time()
 	state.finishedGems = readGems()
 	state.finishedTotalSummons = readTotalSummons()
 	state.pendingBatch = nil
-	saveState(state, "bootstrap_complete")
+	saveState(state, summonWarning == nil and "bootstrap_complete"
+		or "bootstrap_stopped_with_unverified_batch")
 
-	log("STEP", string.format("[4/4] DONE | batches=%d/%d | Gems=%d | TotalSummons=%d.",
+	log("STEP", string.format("[4/4] %s | batches=%d/%d | Gems=%d | TotalSummons=%d.",
+		summonWarning == nil and "DONE" or "STOPPED EARLY",
 		state.verifiedBatches, targetBatches, state.finishedGems, state.finishedTotalSummons))
 	return {
-		status = "COMPLETE",
+		status = summonWarning == nil and "COMPLETE" or "COMPLETE_WITH_WARNINGS",
+		warning = summonWarning,
 		verifiedBatches = state.verifiedBatches,
 		targetBatches = targetBatches,
 		gems = state.finishedGems,
