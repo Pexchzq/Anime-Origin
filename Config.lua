@@ -146,6 +146,11 @@ local Config = {
 		-- Only used by executor builds without appendfile. The ring prevents the
 		-- human-readable fallback log from retaining an entire multi-hour session.
 		maximumRetainedLogLines = 300,
+		-- Bounds the log FILE, not just the in-memory ring. A single Infinite session
+		-- already produced a 2 MB log and a night across many accounts produced a set
+		-- too large to send anywhere. Past this many bytes the file restarts from the
+		-- retained tail. Every controller without its own key uses the same default.
+		maximumLogBytes = 1048576,
 		-- Main's report can contain hundreds of events. Coalesce nonterminal JSON
 		-- snapshots instead of re-encoding the whole report for every diagnostic line.
 		reportFlushInterval = 2,
@@ -427,6 +432,11 @@ local Config = {
 		-- team action in Lua. Files still receive every line through appendfile;
 		-- these limits bound only the in-memory fallback/report history.
 		maximumRetainedLogLines = 300,
+		-- Bounds the log FILE, not just the in-memory ring. A single Infinite session
+		-- already produced a 2 MB log and a night across many accounts produced a set
+		-- too large to send anywhere. Past this many bytes the file restarts from the
+		-- retained tail. Every controller without its own key uses the same default.
+		maximumLogBytes = 1048576,
 		maximumRetainedTeamActions = 300,
 		statePollInterval = 0.2,
 		verifyTimeout = 6,
@@ -575,13 +585,29 @@ local Config = {
 		debug = true,
 		batchInterval = 0.75,
 		maximumBatchSize = 250,
-		maximumStartupJitter = 2,
+		-- Optimizer's own start is spread too. The Loader applies a separate jitter
+		-- before it downloads anything; this one only staggers the optimisation pass.
+		maximumStartupJitter = 10,
 		-- False leaves Roblox/executor FPS control untouched; no foreground or
 		-- background cap is applied by Optimizer.lua.
-		lockFps = false,
+		--
+		-- This was false while every cap below was configured, so none of them did
+		-- anything: dozens of background clients each rendered as fast as the host
+		-- would let them. Enabling it is the single largest CPU saving available
+		-- here and it touches no game logic -- setfpscap only limits rendering.
+		lockFps = true,
+		-- task.wait resolves on Heartbeat, so the frame time is the floor on every
+		-- poll loop in the project. The tightest is statePollInterval = 0.1, which a
+		-- 10 FPS cap (100ms per frame) would sit exactly on top of -- starving the
+		-- verification windows that every remote action depends on. 30 FPS gives a
+		-- 33ms frame, comfortably under that floor, while still roughly halving the
+		-- rendering work against an uncapped client.
+		--
+		-- Lowering backgroundFpsCap below 30 is the obvious next saving, but it must
+		-- be measured against in-match placement timing first, not assumed.
 		fpsCap = 30,
 		foregroundFpsCap = 30,
-		backgroundFpsCap = 10,
+		backgroundFpsCap = 30,
 		adaptiveFocus = true,
 		focusPolicyDelay = 12,
 		-- Keep the world rendered while unfocused to prevent the white/blank screen.

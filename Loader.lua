@@ -9,6 +9,14 @@
 local RAW_ROOT = "https://raw.githubusercontent.com/Pexchzq/Anime-Origin/main/"
 local LOADER_URL = RAW_ROOT .. "Loader.lua"
 
+-- Auto-Execute fires the moment the client attaches, which on a machine running
+-- many clients happens well before the game is actually playable. Every controller
+-- below reads live game state -- remotes, Workspace, PlayerData -- so starting
+-- early is precisely how a client ends up attached but doing nothing.
+if not game:IsLoaded() then
+	game.Loaded:Wait()
+end
+
 -- Executor APIs use different names for the same teleport queue capability.
 -- Queue only the small loader call; every joined place downloads fresh files.
 local queueTeleport = queue_on_teleport
@@ -19,6 +27,20 @@ if typeof(queueTeleport) == "function" then
 		'loadstring(game:HttpGet(%q, true), "AnimeOrigin.Loader")()',
 		LOADER_URL
 	))
+end
+
+-- Every client on this machine reaches this point at the same moment, then all of
+-- them download eight files and walk the whole Lua heap at once. That thundering
+-- herd is what turns a busy host into failed attachments. Spread the start.
+--
+-- This waits only after the teleport queue above is armed: a place transition
+-- during the delay must still bring the loader back, not drop it.
+--
+-- Raise it on a host running many clients:
+--     getgenv().AnimeOriginLoaderJitter = 20
+local jitter = tonumber(getgenv().AnimeOriginLoaderJitter) or 8
+if jitter > 0 then
+	task.wait(math.random() * jitter)
 end
 
 local workerFiles = {

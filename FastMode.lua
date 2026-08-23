@@ -108,6 +108,11 @@ local stateFile = stateFolder .. "/FastModeBootstrap_" .. tostring(player.UserId
 local logFile = stateFolder .. "/FastModeBootstrap_" .. tostring(player.UserId) .. "_latest.log"
 local logBuffer = {}
 local sequence = 0
+-- Both bounds must stay in step with the identical block in main.lua, AutoPlay.lua,
+-- UnitProgression.lua and InGameSettings.lua.
+local maximumRetainedLogLines = math.max(50, tonumber(Settings.maximumRetainedLogLines) or 300)
+local maximumLogBytes = math.max(65536, tonumber(Settings.maximumLogBytes) or 1048576)
+local writtenLogBytes = 0
 
 local function ensureStateFolder()
 	if typeof(makefolder) == "function" and typeof(isfolder) == "function" and not isfolder(stateFolder) then
@@ -131,8 +136,21 @@ local function writeLog(stage, message, data, showInConsole)
 	local line = string.format("[FastMode][%03d][%s] %s%s", sequence, stage, message, suffix)
 	if showInConsole and not consoleStatusOnly then print("[FastMode] " .. message) end
 	table.insert(logBuffer, line)
+	-- appendfile already persists the history, so the Lua table is only a fallback
+	-- ring. Without this bound every formatted diagnostic string is retained for the
+	-- whole session, in every controller, in every client -- which is why RAM climbed
+	-- steadily across a long multi-account run.
+	if #logBuffer > maximumRetainedLogLines then table.remove(logBuffer, 1) end
 	if typeof(appendfile) == "function" then
 		appendfile(logFile, line .. "\n")
+		-- The file itself has no bound either. A session left running for hours
+		-- produced logs too large to send. Restart the file from the retained tail
+		-- once it passes the cap; recent history is what diagnosis actually uses.
+		writtenLogBytes += #line + 1
+		if writtenLogBytes >= maximumLogBytes and typeof(writefile) == "function" then
+			pcall(writefile, logFile, table.concat(logBuffer, "\n") .. "\n")
+			writtenLogBytes = 0
+		end
 	elseif typeof(writefile) == "function" then
 		writefile(logFile, table.concat(logBuffer, "\n") .. "\n")
 	end
@@ -251,11 +269,16 @@ local function resolvePlayerData()
 		timeout = timeout,
 		placeId = game.PlaceId,
 	})
+	-- Same reasoning as UnitProgression's acquisition loop: each pass is a full
+	-- getgc(true) heap walk, so a fixed interval turns a busy host into up to 120 of
+	-- them per client and feeds back on itself. Back off instead.
+	local wait = interval
 	repeat
 		scanPlayerDataOnce()
 		if playerDataIsWrapper then break end
 		if currentPlayerData() and os.clock() >= graceDeadline then break end
-		task.wait(interval)
+		task.wait(math.min(wait, math.max(0, deadline - os.clock())))
+		wait = math.min(wait * 1.5, 8)
 	until os.clock() >= deadline
 	local data = currentPlayerData()
 	if not data then

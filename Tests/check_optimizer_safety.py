@@ -57,7 +57,6 @@ def main() -> int:
         if required not in config:
             fail(f"configured map-root cleanup is missing: {required}", failures)
     for required in (
-        "lockFps = false",
         "disable3DWhenUnfocused = false",
         # Whole-ScreenGui suppression races the game's own lobby/stage HUD
         # transitions. Keep 3D/FPS optimization, but preserve live UI state.
@@ -67,6 +66,29 @@ def main() -> int:
             fail(f"MultiAccount setting is missing: {required}", failures)
     if 'if Settings.lockFps ~= true then' not in optimizer:
         fail("setfpscap calls are not guarded by the lockFps setting", failures)
+
+    # This used to require lockFps = false, which disabled every configured cap and
+    # left dozens of background clients rendering as fast as the host allowed. The
+    # real hazard was never capping itself, it is capping too low: task.wait resolves
+    # on Heartbeat, so the frame time becomes the floor on every poll loop, and the
+    # tightest interval in this project is 0.1s. A 10 FPS cap is a 100ms frame, which
+    # sits exactly on that floor and starves the verification windows every remote
+    # action depends on. Assert the floor instead of forbidding the feature.
+    tightest_poll_seconds = 0.1
+    minimum_safe_fps = int(round(1.0 / (tightest_poll_seconds / 2)))  # 20 FPS
+    for key in ("fpsCap", "foregroundFpsCap", "backgroundFpsCap"):
+        match = re.search(rf"^\s*{key}\s*=\s*(\d+)\s*,", config, re.MULTILINE)
+        if not match:
+            fail(f"MultiAccount setting is missing: {key}", failures)
+            continue
+        value = int(match.group(1))
+        if value < minimum_safe_fps:
+            fail(
+                f"{key} = {value} is below {minimum_safe_fps} FPS; a frame would take "
+                f"longer than half the tightest poll interval ({tightest_poll_seconds}s) "
+                f"and starve remote verification",
+                failures,
+            )
     for required in (
         "UserInputService.WindowFocused",
         "UserInputService.WindowFocusReleased",

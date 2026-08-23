@@ -114,6 +114,8 @@ environment.AnimeOriginAutoPlay = controller
 local logBuffer = {}
 local sequence = 0
 local maximumRetainedLogLines = math.max(50, tonumber(Settings.maximumRetainedLogLines) or 300)
+local maximumLogBytes = math.max(65536, tonumber(Settings.maximumLogBytes) or 1048576)
+local writtenLogBytes = 0
 local maximumRetainedTeamActions = math.max(50, tonumber(Settings.maximumRetainedTeamActions) or 300)
 -- Record monotonic elapsed time in every diagnostic line. This makes placement
 -- latency measurable even when several executor console messages share a timestamp.
@@ -149,6 +151,15 @@ local function log(stage, message, data, console)
 	if console ~= false and not consoleStatusOnly then print("[AutoPlay] " .. message) end
 	if typeof(appendfile) == "function" then
 		appendfile(logFile, line .. "\n")
+		-- The ring bounds memory but not the file. A single Infinite session already
+		-- wrote a 2 MB log, and a night of farming across many accounts produced a
+		-- set too large to send. Restart the file from the retained tail once it
+		-- passes the cap; recent history is what diagnosis actually uses.
+		writtenLogBytes += #line + 1
+		if writtenLogBytes >= maximumLogBytes and typeof(writefile) == "function" then
+			pcall(writefile, logFile, table.concat(logBuffer, "\n") .. "\n")
+			writtenLogBytes = 0
+		end
 	elseif typeof(writefile) == "function" then
 		writefile(logFile, table.concat(logBuffer, "\n") .. "\n")
 	end

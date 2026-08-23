@@ -72,6 +72,8 @@ local logFile = stateFolder .. "/MainRoute_" .. tostring(player.UserId) .. "_lat
 local pollInterval = tonumber(Settings.statePollInterval) or 0.2
 local verifyTimeout = tonumber(Settings.transitionVerifyTimeout) or 12
 local maximumRetainedLogLines = math.max(50, tonumber(Settings.maximumRetainedLogLines) or 300)
+local maximumLogBytes = math.max(65536, tonumber(Settings.maximumLogBytes) or 1048576)
+local writtenLogBytes = 0
 
 local report = {
 	version = 1,
@@ -173,6 +175,14 @@ local function log(stage, message, data, quiet)
 	if #logLines > maximumRetainedLogLines then table.remove(logLines, 1) end
 	if typeof(appendfile) == "function" then
 		pcall(appendfile, logFile, line .. "\n")
+		-- The ring bounds memory but not the file. A night of farming across many
+		-- accounts produced a log set too large to send. Restart the file from the
+		-- retained tail once it passes the cap; recent history is what diagnosis uses.
+		writtenLogBytes += #line + 1
+		if writtenLogBytes >= maximumLogBytes and typeof(writefile) == "function" then
+			pcall(writefile, logFile, table.concat(logLines, "\n") .. "\n")
+			writtenLogBytes = 0
+		end
 	elseif typeof(writefile) == "function" then
 		-- Some executor builds expose writefile without appendfile. Keep the same
 		-- human-readable debug log available instead of silently losing it.

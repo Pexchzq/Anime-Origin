@@ -147,6 +147,11 @@ local report = {
 }
 
 local logBuffer = {}
+-- Both bounds must stay in step with the identical block in main.lua, AutoPlay.lua,
+-- FastMode.lua and InGameSettings.lua.
+local maximumRetainedLogLines = math.max(50, tonumber(Settings.maximumRetainedLogLines) or 300)
+local maximumLogBytes = math.max(65536, tonumber(Settings.maximumLogBytes) or 1048576)
+local writtenLogBytes = 0
 local sequence = 0
 
 local function ensureFolder()
@@ -165,9 +170,22 @@ local function log(stage, message, data, showConsole)
 	local suffix = data ~= nil and (" | " .. encode(data)) or ""
 	local line = string.format("[UnitProgression][%03d][%s] %s%s", sequence, stage, message, suffix)
 	table.insert(logBuffer, line)
+	-- appendfile already persists the history, so the Lua table is only a fallback
+	-- ring. Without this bound every formatted diagnostic string is retained for the
+	-- whole session, in every controller, in every client -- which is why RAM climbed
+	-- steadily across a long multi-account run.
+	if #logBuffer > maximumRetainedLogLines then table.remove(logBuffer, 1) end
 	if showConsole ~= false and not consoleStatusOnly then print("[UnitProgression] " .. message) end
 	if typeof(appendfile) == "function" then
 		appendfile(logFile, line .. "\n")
+		-- The file itself has no bound either. A session left running for hours
+		-- produced logs too large to send. Restart the file from the retained tail
+		-- once it passes the cap; recent history is what diagnosis actually uses.
+		writtenLogBytes += #line + 1
+		if writtenLogBytes >= maximumLogBytes and typeof(writefile) == "function" then
+			pcall(writefile, logFile, table.concat(logBuffer, "\n") .. "\n")
+			writtenLogBytes = 0
+		end
 	elseif typeof(writefile) == "function" then
 		writefile(logFile, table.concat(logBuffer, "\n") .. "\n")
 	end
@@ -265,6 +283,13 @@ do
 	local interval = math.max(0.1, tonumber(Settings.runtimeDiscoveryInterval) or 0.5)
 	local deadline = os.clock() + timeout
 	local attempts, usable = 0, false
+	-- getgc(true) walks the entire Lua heap; measured snapshots here run from 41k to
+	-- 404k objects. Retrying on a fixed interval meant up to 120 full walks per
+	-- client, and the loop got *longer* exactly when the machine was busiest -- a
+	-- loaded host makes the lobby modules appear later, which triggered more walks,
+	-- which loaded the host further. Backing off reaches the same deadline in about
+	-- a dozen walks instead, and eases off under pressure rather than piling on.
+	local wait = interval
 	repeat
 		attempts += 1
 		local ok, objects = pcall(getgc, true)
@@ -276,7 +301,8 @@ do
 			usable = snapshotIsUsable(objects)
 		end
 		if usable then break end
-		task.wait(interval)
+		task.wait(math.min(wait, math.max(0, deadline - os.clock())))
+		wait = math.min(wait * 1.5, 8)
 	until os.clock() >= deadline
 	if typeof(gcObjects) ~= "table" then fail("RUNTIME", "getgc(true) failed.") end
 	if attempts > 1 then
