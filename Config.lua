@@ -207,6 +207,16 @@ local Config = {
 		bootstrapGate = {
 			enabled = true,
 			timeout = 300,
+			-- How long a required worker may publish NOTHING before main treats it as
+			-- dead rather than slow. Both workers publish RUNNING within their first
+			-- moments, so silence past this window means the worker died in startup and
+			-- never got far enough to report its own failure. Without this, absence and
+			-- progress look identical and main waits the full timeout above -- five
+			-- minutes of an account standing in the lobby before it fails too.
+			--
+			-- Must stay above the workers' own 30s Config/LocalPlayer waits, so that a
+			-- worker which is merely slow to start is never called dead.
+			startupGrace = 45,
 			requiredTasks = { "FastMode", "UnitProgression" },
 			-- Both workers must finish before routing. Only FastMode is fatal because
 			-- UnitProgression is optional account enrichment (fuse/shop/feed), not a
@@ -277,7 +287,17 @@ local Config = {
 			occupancyPollInterval = 0.5,
 			portalFailureCooldown = 5,
 			portalRetryDelay = 0.35,
+			-- Budget for finding a usable Pod. It now covers BOTH reasons for not having
+			-- one: every Pod occupied, and the Pod hierarchy not replicated yet. The
+			-- second case used to return instantly, which spent all six transition
+			-- attempts and all three route restarts during the seconds a loaded host
+			-- needs to replicate the lobby -- the account then stood still with a dead
+			-- route on a map that had finished loading moments later.
 			occupiedPortalWaitTimeout = 20,
+			-- CharacterAdded:Wait() is unbounded. A respawn on a loaded host can lag for
+			-- seconds, and a character that never arrives parked the route forever with
+			-- nothing in the log to say why.
+			characterWaitTimeout = 10,
 		},
 	},
 
@@ -488,7 +508,7 @@ local Config = {
 		placementEnabled = true,
 		upgradeEnabled = true,
 		-- Server evidence drives actions; a quarter-second fallback avoids a hot idle
-		-- loop while still placing within one visible frame at the 10 FPS background cap.
+		-- loop while still placing within a few frames at the 30 FPS background cap.
 		gameplayLoopInterval = 0.25,
 		actionRetryDelay = 0.2,
 		-- A false UpgradeTower response is authoritative for that placed UUID.
@@ -578,9 +598,15 @@ local Config = {
 	-- are the only Workspace branches it is allowed to destroy locally.
 	optimizer = {
 		enabled = true,
-		-- MultiAccount is Farm plus an adaptive foreground/background policy. A
-		-- background Roblox client uses 10 FPS, disables 3D and suppresses PlayerGui;
-		-- selecting that window restores the screen automatically for inspection.
+		-- MultiAccount is Farm plus an adaptive foreground/background policy, driven by
+		-- WindowFocused/WindowFocusReleased after focusPolicyDelay.
+		--
+		-- What that policy actually does is decided by the three flags below, NOT by
+		-- the profile name. As configured now it changes only the FPS cap: 3D stays on
+		-- and PlayerGui stays visible in the background, because blanking them caused a
+		-- white screen and a HUD that stayed hidden after refocusing. Read
+		-- disable3DWhenUnfocused / hidePlayerGuiWhenUnfocused / backgroundFpsCap for the
+		-- real behaviour; do not infer it from this name.
 		profile = "MultiAccount", -- Supported: Safe, Farm, MultiAccount, Headless.
 		debug = true,
 		batchInterval = 0.75,

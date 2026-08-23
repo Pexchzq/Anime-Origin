@@ -9,26 +9,46 @@ remote paths และค่าคอนฟิกปะปนกัน ราย
 สถานะ: implementation แยกความรับผิดชอบแล้ว เนื้อหา Phase 1 ด้านล่างเก็บไว้เป็น
 ประวัติการออกแบบเท่านั้น ไม่ใช่ลำดับรันปัจจุบัน
 
-ลำดับปัจจุบัน:
+ลำดับปัจจุบัน (ตัวเลขทั้งหมดอ่านจาก `Config.lua` ไม่ใช่ค่าคงที่ในโค้ด):
 
 ```text
 FastMode.lua
   -> เคลมรางวัลทุกบัญชี
-  -> เฉพาะ TotalSummons = 0 จึงสุ่มได้สูงสุด 10 ชุด
+  -> เฉพาะ TotalSummons = newAccountTotalSummons (0) จึงเข้า summon bootstrap
+  -> เพดานการใช้เพชรคือ maximumSummonBatches (20 ชุด = 200 summons)
 
 main.lua
   -> Normal Act แรกใน WestCity 1-6 ที่ยังไม่ผ่าน
-  -> เมื่อผ่านครบแต่เลเวล < 15 ให้ Replay WestCity Act 1 Hard
-  -> เมื่อเลเวล >= 15 ให้เข้า WestCity Infinite Hard
-  -> Infinite ได้สัญญาณ Wave 20 ให้ RestartGame
+  -> เมื่อผ่านครบแต่เลเวล < minimumInfiniteLevel (20) ให้ Replay WestCity Act 1 Hard
+  -> เมื่อเลเวล >= minimumInfiniteLevel (20) ให้เข้า WestCity Infinite Hard
+  -> Infinite ถึง restartInfiniteAtWave (15) ให้ RestartGame
 
 AutoPlay.lua
   -> เลือกทีม วาง และอัปเกรดยูนิตภายในแต่ละแมตช์
 ```
 
+`maximumSummonBatches` เป็น **เพดานการใช้จ่าย** ไม่ใช่เกณฑ์คัดกรองบัญชี บัญชีที่
+`TotalSummons` สูงกว่า `newAccountTotalSummons` คือบัญชีฟาร์ม และเพชรของมันจะไม่ถูก
+ใช้เลยไม่ว่าจะสะสมเพิ่มอีกเท่าไหร่ การเอา "ยังไม่ถึง 20 ชุด" มาใช้เป็นเกณฑ์คัดกรองจะ
+จัดบัญชีฟาร์มที่ยังไม่ถึง 200 summons เป็นบัญชีใหม่แล้วดูดเพชรทิ้ง การจัดประเภทเกิด
+ครั้งเดียวในรอบแรกที่เห็นบัญชีนั้น แล้วบันทึกเป็น `accountClass`
+
 ทุก transition ของ `main.lua` ต้องมีหลักฐานจาก `AfterMapSelect`, `TeleportGui`,
 `OnTeleport`, `UpdateClientGame`, `StartWaveVote` หรือ MatchRuntime ตามชนิด action;
 การเรียก `FireServer` อย่างเดียวไม่ถือว่าสำเร็จ
+
+การเข้า Story Pod ก่อน `StartSelection` ใช้ `firetouchinterest` บน `DoorUIPart` เป็น
+เส้นทางหลัก และถอยไปเดินเข้าจริงเมื่อ touch ไม่ได้ผล — รายละเอียดและหลักฐานอยู่ใน
+`README.md` หัวข้อ "การเข้า Story Pod"
+
+---
+
+## ประวัติการออกแบบ Phase 1 (ไม่ใช่พฤติกรรมปัจจุบัน)
+
+ทุกอย่างตั้งแต่หัวข้อนี้จนถึง "Mode: Fast Gems — In-game phase" คือแผน Phase 1 ดั้งเดิม
+เก็บไว้เพื่อดูเหตุผลของการออกแบบเท่านั้น **อย่าใช้เป็นข้อมูลอ้างอิงของระบบที่รันอยู่**
+ความรับผิดชอบถูกแยกไปแล้ว: การเลือก/สวมทีมเป็นของ `AutoPlay.lua` ไม่ใช่ FastMode และ
+การเลือกด่านเป็นของ `main.lua`
 
 ### เป้าหมาย
 
@@ -159,8 +179,16 @@ AutoPlay.lua
   remotes must never be added to this file.
 - Damage units are ranked using the highest `StageStats` level after applying
   the owned UUID Grade multipliers. `DPS = Damage / Cooldown`; Range breaks ties.
-- The desired slot order is three damage units, LEO in slot 4 (or damage fallback),
-  then the next two damage units.
+- The desired slot order depends on `useFarmerUnit`. It is currently **`false`**, so
+  the loadout is all damage and slot 4 receives the next highest-DPS unit; farmer
+  placement, the money reserve and farmer upgrades are all skipped because no
+  equipped farmer capacity exists. `targetFarmerPlacements = 3` and
+  `farmerPreferredSlot = 4` stay in Config but are dormant until the flag is `true`,
+  at which point the order becomes three damage units, Leorio in slot 4, then the
+  next two damage units.
+- `minimumLowCostDamageSlots = 1` reserves at least one damage slot for a unit whose
+  initial placement cost is at or below `maximumLowCostDamagePlacementCost`, so an
+  all-legendary loadout cannot end up unable to afford its first placement.
 - Slots 4–6 are detected from server acceptance in `EquippedTowers`, not from UI
   lock cards or a fixed account-level assumption.
 - Every unequip/equip action is followed by a runtime verification before the
@@ -185,8 +213,12 @@ AutoPlay.lua
 - The runtime callbacks read the server-replicated `Money` attribute before an
   action. AutoPlay uses the same source only as a budget gate and still requires
   the server response as final proof.
-- WestCity Ground/Hill points captured from real server responses are enabled in
+- WestCity Ground points captured from real server responses are enabled in
   `Config.lua`. Every other world still needs its own configured point set.
+- Hill towers are **excluded** on this route (`excludedPlacementTypes.Hill = true`):
+  WestCity has no reliable ground location for them here, so they are dropped
+  before loadout construction and the next DPS candidate is promoted, rather than
+  equipping a unit AutoPlay cannot place.
 
 ### Implemented: focused discovery pass
 

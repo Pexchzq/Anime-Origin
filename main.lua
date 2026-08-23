@@ -230,7 +230,16 @@ local function waitForBootstrapWorkers()
 		FastMode = Config.fastGems,
 		UnitProgression = Config.unitProgression,
 	}
-	local deadline = os.clock() + (tonumber(gate.timeout) or 300)
+	local gateStartedAt = os.clock()
+	local deadline = gateStartedAt + (tonumber(gate.timeout) or 300)
+	-- Both workers publish RUNNING within their first moments of executing. If
+	-- nothing has appeared after this window, the worker died during startup --
+	-- before it could ever report FAILED -- and to the loop below "no signal" is
+	-- indistinguishable from "still working". That is how one silent startup death
+	-- became five minutes of an account standing in the lobby before main timed out
+	-- and failed too. Prolonged absence IS a failure signal; feed it into the same
+	-- fatal / non-fatal policy that a self-reported failure already goes through.
+	local startupGrace = math.max(5, tonumber(gate.startupGrace) or 45)
 	local lastSignature
 	report.status = "WAITING_FOR_BOOTSTRAP"
 
@@ -246,20 +255,30 @@ local function waitForBootstrapWorkers()
 			local feature = featureSettings[taskName]
 			local entry = typeof(tasks) == "table" and rawget(tasks, taskName) or nil
 			local status
+			local silent
 			if typeof(feature) == "table" and feature.enabled == false then
 				status = "SKIPPED"
 			elseif typeof(entry) == "table" and entry.userId == player.UserId then
 				status = tostring(entry.status or "PENDING")
+			elseif os.clock() - gateStartedAt >= startupGrace then
+				status = "FAILED"
+				-- %s, not %d: startupGrace comes from Config and a fractional value would
+				-- make string.format itself error -- inside the very path that reports a
+				-- failure, turning a diagnosable stall into an unexplained crash.
+				silent = string.format("published no lifecycle signal within %ss; it died during startup",
+					tostring(startupGrace))
 			else
 				status = "PENDING"
 			end
-			snapshot[taskName] = status
+			snapshot[taskName] = silent and (status .. " (no signal)") or status
 			if status == "FAILED" and fatalTasks[taskName] == true then
 				report.bootstrapGate = snapshot
-				fail("BOOTSTRAP", taskName .. " failed; main routing was not started.")
+				fail("BOOTSTRAP", taskName .. " failed; main routing was not started."
+					.. (silent and (" It " .. silent .. ".") or ""))
 			elseif status == "FAILED" then
 				report.bootstrapWarnings = report.bootstrapWarnings or {}
-				report.bootstrapWarnings[taskName] = "Worker failed after a bounded run; routing continued."
+				report.bootstrapWarnings[taskName] = silent
+					or "Worker failed after a bounded run; routing continued."
 			end
 			local terminal = status == "COMPLETE" or status == "SKIPPED" or status == "FAILED"
 			if not terminal then allComplete = false end
@@ -855,10 +874,9 @@ local function modelCenter(container)
 	return count > 0 and (total / count) or nil
 end
 
--- Teleport only to the outside approach point, then use Humanoid:MoveTo through
--- the real DoorUIPart. This preserves the server's PlayersInside/MapSelect flow.
--- MapSelect arrived. The Pod is only ours if the server's own occupancy snapshot
--- names this player and shows nobody else holding it.
+-- Called once MapSelect has arrived, by either entry route. MapSelect alone only
+-- proves the server noticed an entry: the Pod is ours only if the server's own
+-- occupancy snapshot names this player and shows nobody else holding it.
 local function confirmPodEntry(portal, beforeOccupancy)
 	-- UpdatePlayersInside normally arrives just before MapSelect, but do not
 	-- depend on network callback ordering. Give the matching local-player Pod
@@ -902,7 +920,17 @@ local function fireDoorTouch(portal, root)
 end
 
 local function tryEnterStoryPortal(portal, deadline)
-	local character = player.Character or player.CharacterAdded:Wait()
+	-- CharacterAdded:Wait() has no timeout. A respawn on a loaded host can lag for
+	-- many seconds, and if the character never arrives at all this parks the whole
+	-- route forever with the account standing still and nothing in the log to say
+	-- why. Every other wait on this path is bounded; so is this one.
+	local character = player.Character
+	if not character then
+		waitUntil(function() return player.Character ~= nil end,
+			tonumber(Entrance.characterWaitTimeout) or 10)
+		character = player.Character
+	end
+	if not character then return false, "character did not spawn within the entry window", portal end
 	local root = character:FindFirstChild("HumanoidRootPart")
 	local humanoid = character:FindFirstChildOfClass("Humanoid")
 	if not root or not humanoid then return false, "character root/humanoid missing", portal end
@@ -969,7 +997,16 @@ local function enterStoryPortal()
 	local attemptedPortal
 	repeat
 		local portalCandidates = resolvePortalCandidates()
-		if #portalCandidates == 0 then return false, lastError end
+		-- Zero candidates used to return immediately. That is wrong on a loaded host:
+		-- the lobby's MapSelectors branch has simply not replicated yet during the
+		-- first seconds after a join, so the bail consumed every transition attempt
+		-- AND every route restart before the Pods ever existed -- leaving the account
+		-- standing in the lobby with a dead route. This loop already owns a deadline
+		-- (occupiedPortalWaitTimeout); an absent Pod is no more fatal than a busy one,
+		-- so wait for replication inside that same budget instead of giving up.
+		if #portalCandidates == 0 then
+			lastError = "Story Pod hierarchy has not replicated yet"
+		end
 		for index = 1, #portalCandidates do
 			local portal = portalCandidates[index]
 			local failedAt = recentPortalFailures[portal]

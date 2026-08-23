@@ -133,11 +133,28 @@ local RemoteRegistry = {
 			},
 		},
 
+		-- PRECONDITION, measured: the server ignores StartSelection until it has seen
+		-- this player enter a Story Pod. Firing it from outside a Pod was refused 26
+		-- times out of 26 -- no AfterMapSelect, no MapSelect of any kind.
+		--
+		-- The Pod's DoorUIPart carries a TouchInterest (a TouchTransmitter), which is
+		-- the structural proof that .Touched is connected server-side. Raising that
+		-- event satisfies the precondition without moving the character:
+		--
+		--     firetouchinterest(humanoidRootPart, doorUIPart, 0)
+		--     task.wait(0.15)
+		--     firetouchinterest(humanoidRootPart, doorUIPart, 1)
+		--
+		-- Verified by Probes/PodEntryBypassProbe.lua from 180 studs away with no
+		-- movement and no CFrame write: the server answered MapSelect and
+		-- UpdatePlayersInside naming this player, then accepted StartSelection, on the
+		-- first attempt.
 		start_map_selection = {
-			description = "Select a stage without starting it.",
+			description = "Select a stage without starting it. Requires a Story Pod entry first.",
 			path = "ReplicatedStorage.LobbyRemotes.MapSelectRemote",
 			remoteType = "RemoteEvent",
 			method = "FireServer",
+			precondition = "Server has observed this player entering a Story Pod (walk in, or fire the DoorUIPart TouchInterest).",
 			arguments = {
 				{ name = "action", type = "string", example = "StartSelection" },
 				{ name = "mode", type = "string", example = "Story", userEditable = true },
@@ -146,6 +163,7 @@ local RemoteRegistry = {
 				{ name = "act", type = "string", example = "1", userEditable = true },
 				{ name = "difficulty", type = "string", example = "Normal", userEditable = true },
 			},
+			verification = "AfterMapSelect arrives and its target matches the requested mode/world/act/difficulty. Firing alone is not success.",
 		},
 
 		-- Final Start button. The tracer persisted this call before the immediate
@@ -155,9 +173,11 @@ local RemoteRegistry = {
 			path = "ReplicatedStorage.LobbyRemotes.MapSelectRemote",
 			remoteType = "RemoteEvent",
 			method = "FireServer",
+			precondition = "A matching AfterMapSelect from start_map_selection has already been observed.",
 			arguments = {
 				{ name = "action", type = "string", example = "StartTeleport" },
 			},
+			verification = "TeleportGui arrives, or LocalPlayer.OnTeleport fires. Firing alone is not success.",
 		},
 	},
 

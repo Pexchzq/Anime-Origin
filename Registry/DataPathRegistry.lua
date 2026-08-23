@@ -10,8 +10,24 @@ local DataPaths = {
 	-- Canonical automation sources. These are runtime tables and do not require
 	-- opening HUD, Profile, or Units screens. A resolver must rediscover the
 	-- containing callback/getgc table each session because getgc indices drift.
+	--
+	-- RESOLVER CONTRACT, learned the hard way: getgc(true) exposes at least three
+	-- things that all satisfy a naive PlayerData shape test --
+	--
+	--   1. the WRAPPER: a table with a .PlayerData field. Only this one keeps
+	--      receiving server writes. Always prefer it.
+	--   2. the inner PlayerData table itself.
+	--   3. detached warm-up copies made before the account finished loading.
+	--
+	-- Binding (2) or (3) is silent and total: every claim, redeem and summon still
+	-- reports "no state change" while the server is actually crediting the account,
+	-- because the bound table is simply not the one being written to. A resolver
+	-- must scan the WHOLE snapshot and prefer a wrapper before settling for a bare
+	-- table, and must re-scan on every verification rather than trusting the table
+	-- it bound at attach time. See Config.fastGems.bootstrap.wrapperGraceTimeout.
 	runtime = {
 		-- Root client state containing Currency, Towers, account progression, etc.
+		-- <RuntimeResolver> is the wrapper described in the resolver contract above.
 		playerData = "<RuntimeResolver>.PlayerData",
 		gems = "<RuntimeResolver>.PlayerData.Inventory.Currency.Gems",
 		-- Confirmed internal currency key for the inventory item's displayed

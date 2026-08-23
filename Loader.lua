@@ -9,14 +9,10 @@
 local RAW_ROOT = "https://raw.githubusercontent.com/Pexchzq/Anime-Origin/main/"
 local LOADER_URL = RAW_ROOT .. "Loader.lua"
 
--- Auto-Execute fires the moment the client attaches, which on a machine running
--- many clients happens well before the game is actually playable. Every controller
--- below reads live game state -- remotes, Workspace, PlayerData -- so starting
--- early is precisely how a client ends up attached but doing nothing.
-if not game:IsLoaded() then
-	game.Loaded:Wait()
-end
-
+-- Arm the teleport queue FIRST, before anything below can yield. Every wait after
+-- this point is a window in which a place transition would otherwise drop the
+-- script permanently, and the load wait below can be the longest wait of the run.
+--
 -- Executor APIs use different names for the same teleport queue capability.
 -- Queue only the small loader call; every joined place downloads fresh files.
 local queueTeleport = queue_on_teleport
@@ -27,6 +23,24 @@ if typeof(queueTeleport) == "function" then
 		'loadstring(game:HttpGet(%q, true), "AnimeOrigin.Loader")()',
 		LOADER_URL
 	))
+end
+
+-- Auto-Execute fires the moment the client attaches, which on a machine running
+-- many clients happens well before the game is actually playable. Every controller
+-- below reads live game state -- remotes, Workspace, PlayerData -- so starting
+-- early is precisely how a client ends up attached but doing nothing.
+--
+-- Polled rather than `game.Loaded:Wait()`, for two reasons. The signal fires once,
+-- so a build where it has already fired would park here forever. And this must be
+-- bounded: if loading genuinely stalls, proceeding is better than never running at
+-- all -- each controller has its own runtimeLoadTimeout and will keep looking for
+-- live state, whereas an unbounded wait here produces a client that is attached
+-- and permanently silent.
+if not game:IsLoaded() then
+	local loadDeadline = os.clock() + (tonumber(getgenv().AnimeOriginLoaderLoadTimeout) or 120)
+	repeat
+		task.wait(0.2)
+	until game:IsLoaded() or os.clock() >= loadDeadline
 end
 
 -- Every client on this machine reaches this point at the same moment, then all of
