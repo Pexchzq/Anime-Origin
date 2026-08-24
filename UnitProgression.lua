@@ -22,6 +22,13 @@ local HttpService = game:GetService("HttpService")
 
 local environment = getgenv()
 
+-- Shared milestone trace. Resolved per call rather than captured at load time,
+-- because Config publishes the tracer and Auto-Execute does not guarantee order.
+local function trace(message, data)
+	local tracer = environment.AnimeOriginTrace
+	if typeof(tracer) == "function" then tracer("UnitProgress", message, data) end
+end
+
 -- MacSploit starts Auto-Execute files without a dependable inter-file order.
 -- Wait for shared configuration and LocalPlayer so this worker can then wait on
 -- FastMode through the lifecycle gate instead of dying before that gate exists.
@@ -85,6 +92,7 @@ local isLobbyPlace = typeof(lobbyPlaces) == "table" and lobbyPlaces[game.PlaceId
 if not isLobbyPlace then
 	local skipped = { status = "SKIPPED_STAGE", placeId = game.PlaceId, jobId = game.JobId }
 	publishLifecycle("SKIPPED", { phase = "context", reason = "stage place" })
+	trace("SKIPPED: stage place, lobby progression does not apply here")
 	if environment.AnimeOriginUnitProgressionRunning == runToken then
 		environment.AnimeOriginUnitProgressionRunning = nil
 	end
@@ -96,6 +104,7 @@ if not isLobbyPlace then
 end
 
 publishLifecycle("RUNNING", { phase = "startup" })
+trace("start", { placeId = game.PlaceId, userId = player.UserId })
 
 -- FastMode adds/removes inventory UUIDs while summoning and Auto Sell may remove
 -- Rare copies. Wait before taking any inventory/stat snapshot so progression ranks
@@ -121,7 +130,11 @@ local function waitForFastModeDependency()
 	error("[UnitProgression][DEPENDENCY] Timed out waiting for FastMode completion.", 0)
 end
 
+-- This wait is silent for up to the whole bootstrap timeout, so without these two
+-- lines a capture cannot tell "blocked on FastMode" from "hung on its own".
+trace("waiting for FastMode before snapshotting inventory")
 waitForFastModeDependency()
+trace("FastMode dependency satisfied")
 
 local stateFolder = tostring(Settings.stateFolder or "AnimeOrigin")
 local reportFile = stateFolder .. "/UnitProgression_" .. tostring(player.UserId) .. "_latest.json"
@@ -212,6 +225,22 @@ local function fail(stage, message)
 		environment.AnimeOriginUnitProgressionRunning = nil
 	end
 	error(string.format("[UnitProgression][%s] %s", stage, message), 0)
+end
+
+-- `parent:WaitForChild(name)` with no timeout yields FOREVER. The remote lookups
+-- below run at MODULE scope -- before run() and its xpcall exist -- so an infinite
+-- yield there leaves this worker's lifecycle entry at RUNNING permanently. main
+-- cannot tell that apart from "still working", so the account stands in the lobby
+-- until the bootstrap gate runs out. Bound every lookup and route a missing remote
+-- through fail(), which publishes the terminal signal main is waiting for.
+local function requireChild(parent, name)
+	local timeout = math.max(1, tonumber(Settings.remoteWaitTimeout) or 30)
+	local child = parent:WaitForChild(name, timeout)
+	if not child then
+		fail("REMOTE", string.format("%s.%s did not replicate within %ss.",
+			parent:GetFullName(), tostring(name), tostring(timeout)))
+	end
+	return child
 end
 
 local function waitFor(predicate, timeout)
@@ -822,12 +851,16 @@ local function balanceBudget(target, cohort, smallestResourceExp)
 	return math.min(remaining, desired)
 end
 
-local inventoryFunction = ReplicatedStorage:WaitForChild("Remotes")
-	:WaitForChild("InventoryRemotes"):WaitForChild("InventoryFunction")
-local inventoryRemote = ReplicatedStorage.Remotes.InventoryRemotes:WaitForChild("InventoryRemote")
-local lobbyRemotes = ReplicatedStorage:WaitForChild("LobbyRemotes")
-local shopRemote = lobbyRemotes:WaitForChild("ShopRemote")
-local shopFunction = lobbyRemotes:WaitForChild("ShopFunction")
+local inventoryRemotes = requireChild(requireChild(ReplicatedStorage, "Remotes"), "InventoryRemotes")
+local inventoryFunction = requireChild(inventoryRemotes, "InventoryFunction")
+-- Was `ReplicatedStorage.Remotes.InventoryRemotes:WaitForChild(...)`: direct indexing
+-- raises a RAW error when the folder has not replicated, and a raw error at module
+-- scope bypasses fail() entirely -- leaving the lifecycle stuck at RUNNING instead of
+-- reporting FAILED. Reuse the container resolved above through the bounded path.
+local inventoryRemote = requireChild(inventoryRemotes, "InventoryRemote")
+local lobbyRemotes = requireChild(ReplicatedStorage, "LobbyRemotes")
+local shopRemote = requireChild(lobbyRemotes, "ShopRemote")
+local shopFunction = requireChild(lobbyRemotes, "ShopFunction")
 
 local function configuredLockCandidates()
 	local result = {}
@@ -1449,6 +1482,10 @@ environment.AnimeOriginUnitProgressionReport = ok and result or {
 	reportFile = reportFile,
 	logFile = logFile,
 }
+trace(ok and "COMPLETE" or "FAILED", {
+	reportStatus = ok and result.status or "FAILED",
+	error = not ok and tostring(result):sub(1, 220) or nil,
+})
 publishLifecycle(ok and "COMPLETE" or "FAILED", {
 	reportStatus = ok and result.status or "FAILED",
 	reportFile = reportFile,

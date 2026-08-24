@@ -28,6 +28,13 @@ local Stats = game:GetService("Stats")
 
 local environment = getgenv()
 
+-- Shared milestone trace. Resolved per call rather than captured at load time,
+-- because Config publishes the tracer and Auto-Execute does not guarantee order.
+local function trace(message, data)
+	local tracer = environment.AnimeOriginTrace
+	if typeof(tracer) == "function" then tracer("Optimizer", message, data) end
+end
+
 local function waitForConfig(timeout)
 	local deadline = os.clock() + (tonumber(timeout) or 30)
 	repeat
@@ -965,6 +972,14 @@ end
 
 report.status = "RUNNING"
 report.readyAt = os.time()
+trace("profile active", {
+	profile = profile,
+	mutations = report.mutations,
+	-- lockFps was once true in name only: every cap under it was configured while the
+	-- flag itself was false, so dozens of background clients rendered uncapped.
+	lockFps = Settings.lockFps == true,
+	fpsCap = tonumber(Settings.fpsCap),
+})
 log(string.format("%s profile active: %d visual mutations from %d relevant instances.",
 	profile, report.mutations, report.processed), report.byClass)
 saveTelemetry("optimizer ready")

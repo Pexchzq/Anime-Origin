@@ -16,6 +16,13 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local environment = getgenv()
 
+-- Shared milestone trace. Resolved per call rather than captured at load time,
+-- because Config publishes the tracer and Auto-Execute does not guarantee order.
+local function trace(message, data)
+	local tracer = environment.AnimeOriginTrace
+	if typeof(tracer) == "function" then tracer("LogStats", message, data) end
+end
+
 -- Stop an older observer before attaching a fresh set of listeners. Re-running
 -- this file therefore cannot multiply polling loops or duplicate console lines.
 local previous = environment.AnimeOriginLogStats
@@ -337,6 +344,7 @@ task.spawn(function()
 		emitSnapshot(readSnapshot())
 	end))
 
+	trace("observing", { placeId = game.PlaceId })
 	local pollInterval = math.max(0.05, tonumber(settings.pollInterval) or 0.2)
 	local discoveryInterval = math.max(0.25, tonumber(settings.runtimeDiscoveryInterval) or 0.5)
 	local grace = math.max(5, tonumber(settings.dependencyGraceSeconds) or 60)

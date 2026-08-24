@@ -23,6 +23,13 @@ local HttpService = game:GetService("HttpService")
 
 local environment = getgenv()
 
+-- Shared milestone trace. Resolved per call rather than captured at load time,
+-- because Config publishes the tracer and Auto-Execute does not guarantee order.
+local function trace(message, data)
+	local tracer = environment.AnimeOriginTrace
+	if typeof(tracer) == "function" then tracer("Main", message, data) end
+end
+
 -- Auto-Execute order is intentionally treated as nondeterministic. main.lua may
 -- be injected before Config.lua during a join, so wait for both shared config and
 -- LocalPlayer before creating route state or lifecycle listeners.
@@ -212,6 +219,10 @@ local function waitUntil(predicate, timeout)
 	return ok and result == true
 end
 
+-- Anchored on the first gate entry and deliberately NOT reset per supervised
+-- attempt; see the comment on the deadline below.
+local gateStartedAt
+
 -- FastMode and UnitProgression own separate phases of the lobby pipeline. Routing
 -- waits for both workers to become terminal, but only tasks explicitly marked
 -- fatal may stop map selection. Persistent unit leveling is useful enrichment;
@@ -230,7 +241,13 @@ local function waitForBootstrapWorkers()
 		FastMode = Config.fastGems,
 		UnitProgression = Config.unitProgression,
 	}
-	local gateStartedAt = os.clock()
+	-- The budget belongs to the ACCOUNT's lobby bootstrap, not to one supervised
+	-- attempt. run() is called again by the supervisor after every route error, and
+	-- a per-call deadline handed each attempt a fresh 300s -- so a worker stuck at a
+	-- non-terminal status cost 4 x 300s of an account standing still before the route
+	-- died for good. Restarting main also never restarts the workers, so every one of
+	-- those attempts re-observed the exact same stuck entry. Anchor the deadline once.
+	gateStartedAt = gateStartedAt or os.clock()
 	local deadline = gateStartedAt + (tonumber(gate.timeout) or 300)
 	-- Both workers publish RUNNING within their first moments of executing. If
 	-- nothing has appeared after this window, the worker died during startup --
@@ -239,8 +256,11 @@ local function waitForBootstrapWorkers()
 	-- became five minutes of an account standing in the lobby before main timed out
 	-- and failed too. Prolonged absence IS a failure signal; feed it into the same
 	-- fatal / non-fatal policy that a self-reported failure already goes through.
-	local startupGrace = math.max(5, tonumber(gate.startupGrace) or 45)
+	local startupGrace = math.max(5, tonumber(gate.startupGrace) or 75)
 	local lastSignature
+	-- Retained so the timeout path below can judge WHICH task was still non-terminal
+	-- rather than failing the route on whichever worker happens to be slow.
+	local lastSnapshot
 	report.status = "WAITING_FOR_BOOTSTRAP"
 
 	repeat
@@ -290,12 +310,43 @@ local function waitForBootstrapWorkers()
 			report.bootstrapGate = snapshot
 			log("BOOTSTRAP", allComplete and "Lobby workers are complete."
 				or "Waiting for lobby workers before route selection.", snapshot)
+			-- Every change of the gate snapshot, not a heartbeat: this is what turns
+			-- "the account just stands there" into a named worker and a named status.
+			trace(allComplete and "bootstrap gate open" or "bootstrap gate waiting", snapshot)
 		end
 		if allComplete then return true end
+		lastSnapshot = snapshot
 		task.wait(pollInterval)
 	until os.clock() >= deadline
 
-	fail("BOOTSTRAP", "Timed out waiting for FastMode/UnitProgression completion signals.")
+	-- Timing out is the same evidence as a self-reported failure -- the worker did
+	-- not finish -- so it must go through the same fatal / non-fatal policy. Failing
+	-- unconditionally here ignored fatalTasks entirely: a merely slow UnitProgression,
+	-- which Config explicitly marks non-fatal because leveling is enrichment rather
+	-- than a routing prerequisite, killed the whole route while FastMode had already
+	-- reported COMPLETE. Only a non-terminal FATAL task may stop map selection.
+	local stalled = lastSnapshot or {}
+	local blocking = {}
+	for _, taskName in ipairs(required) do
+		local status = tostring(stalled[taskName] or "PENDING")
+		local terminal = status == "COMPLETE" or status == "SKIPPED" or status:find("FAILED", 1, true) ~= nil
+		if not terminal and fatalTasks[taskName] == true then
+			table.insert(blocking, taskName .. "=" .. status)
+		end
+	end
+	report.bootstrapGate = stalled
+	if #blocking > 0 then
+		fail("BOOTSTRAP", string.format(
+			"Timed out after %ss with a fatal worker still non-terminal (%s); main routing was not started.",
+			tostring(tonumber(gate.timeout) or 300), table.concat(blocking, ", ")))
+	end
+	report.bootstrapWarnings = report.bootstrapWarnings or {}
+	report.bootstrapWarnings.timeout = string.format(
+		"Gate timed out after %ss; only non-fatal workers were still running, so routing continued.",
+		tostring(tonumber(gate.timeout) or 300))
+	trace("bootstrap gate TIMED OUT on non-fatal workers only; routing continues", stalled)
+	log("BOOTSTRAP", "Bootstrap gate timed out on non-fatal workers only; continuing to route selection.", stalled)
+	return true
 end
 
 local function loadState()
@@ -577,6 +628,11 @@ local bus = {
 	startVoteGeneration = 0,
 	actOverGeneration = 0,
 	teleportGeneration = 0,
+	-- Kept apart from teleportGeneration on purpose: a failed teleport is evidence
+	-- that the transition did NOT happen, and folding it into the success counter is
+	-- what let a rate-limited host report a verified teleport it never performed.
+	teleportFailureGeneration = 0,
+	lastTeleportFailure = nil,
 	waveGeneration = 0,
 	currentStage = nil,
 	currentWave = nil,
@@ -720,9 +776,29 @@ task.spawn(function()
 	end
 end)
 
+-- OnTeleport reports a FAILED teleport through the same signal as a successful
+-- one. Incrementing the generation for every state made failure indistinguishable
+-- from success, and that is exactly the signal a loaded host produces: Roblox
+-- rate-limits matchmaking (HTTP 429) and answers with TeleportState.Failed. Main
+-- read that as proof, set TELEPORTING_TO_STAGE, and the supervisor returned for
+-- good -- leaving the account standing in the lobby with a report that claimed the
+-- transition had been verified. Count only states that mean the teleport is
+-- actually under way; surface a failure as its own, separately observable event.
 table.insert(controller.connections, player.OnTeleport:Connect(function(teleportState, placeId, spawnName)
-	bus.teleportGeneration += 1
-	log("TELEPORT", tostring(teleportState), { placeId = placeId, spawnName = spawnName }, true)
+	local failed = teleportState == Enum.TeleportState.Failed
+	if failed then
+		bus.teleportFailureGeneration += 1
+		bus.lastTeleportFailure = { placeId = placeId, at = os.time() }
+	else
+		bus.teleportGeneration += 1
+	end
+	log("TELEPORT", tostring(teleportState), {
+		placeId = placeId,
+		spawnName = spawnName,
+		-- Named explicitly so a captured log shows why a Failed line did not advance
+		-- the route, instead of looking like a transition that silently went nowhere.
+		countedAsEvidence = not failed,
+	}, true)
 end))
 
 local function resolveWorkspacePath(path)
@@ -1143,6 +1219,7 @@ local function startSelectedStage(target)
 
 	-- Selection is accepted; ask for the teleport and require TeleportGui as proof.
 	local function completeTeleport(via, attempt)
+		trace("StartSelection accepted by the server", { via = via, attempt = attempt })
 		action.selectionVerified = true
 		action.selectionVia = via
 		action.selectionAttempt = attempt
@@ -1152,6 +1229,9 @@ local function startSelectedStage(target)
 		local teleportAction = recordAction("START_TELEPORT", target)
 		mapRemote:FireServer("StartTeleport")
 		local teleported = waitUntil(function() return bus.teleportGeneration > beforeTeleport end, verifyTimeout)
+		if not teleported then
+			trace("StartTeleport NOT confirmed by the server", { via = via, attempt = attempt })
+		end
 		teleportAction.verified = teleported
 		action.verified = teleported
 		if not teleported then
@@ -1164,7 +1244,46 @@ local function startSelectedStage(target)
 		saveState("server accepted stage teleport")
 		report.status = "TELEPORTING_TO_STAGE"
 		saveReport("stage teleport verified")
-		return true
+
+		-- The server accepting StartTeleport is not the same as Roblox moving the
+		-- client, and only the second one ends the session in this place. A real place
+		-- transition tears this script down, so reaching the line after this loop is
+		-- itself the proof that the teleport never landed.
+		--
+		-- Without this the supervisor treated TELEPORTING_TO_STAGE as committed and
+		-- returned permanently, which on a rate-limited host is how an account ended
+		-- up standing in the lobby with no controller left watching it.
+		local settleTimeout = math.max(1, tonumber(Settings.stageTeleportSettleTimeout) or 20)
+		local settleDeadline = os.clock() + settleTimeout
+		local failuresBefore = bus.teleportFailureGeneration
+		repeat
+			if not controller.active then return false end
+			if bus.teleportFailureGeneration > failuresBefore then break end
+			task.wait(pollInterval)
+		until os.clock() >= settleDeadline
+
+		local reason = bus.teleportFailureGeneration > failuresBefore
+			and "Roblox reported TeleportState.Failed after the server accepted it"
+			or string.format("the place never changed within %ss of an accepted StartTeleport", tostring(settleTimeout))
+		teleportAction.verified = false
+		teleportAction.landed = false
+		action.verified = false
+		-- Move off TELEPORTING_TO_STAGE before returning. The supervisor uses that
+		-- status to decide the place lifecycle is already committed and a restart
+		-- would race it; leaving it set here would suppress the retry this needs.
+		report.status = "STAGE_TELEPORT_STALLED"
+		trace("teleport DID NOT LAND", { attempt = attempt, via = via, reason = reason })
+		log("TELEPORT", "Accepted StartTeleport did not land; retrying instead of assuming success.", {
+			attempt = attempt,
+			via = via,
+			reason = reason,
+			lastFailure = bus.lastTeleportFailure,
+		}, true)
+		-- Forced: this is the line that explains an account which looked like it had
+		-- teleported. Coalescing it behind reportFlushInterval risks losing it if the
+		-- next attempt does land and tears the script down.
+		saveReport("stage teleport did not land", true)
+		return false
 	end
 
 	-- Walking into a Pod is only how the game's own UI opens the map screen; the
@@ -1190,6 +1309,12 @@ local function startSelectedStage(target)
 
 	for attempt = 1, maximumAttempts do
 		local entered, entryError, selectedPortal = enterStoryPortal()
+		trace(entered and "Story Pod entry accepted" or "Story Pod entry REFUSED", {
+			attempt = attempt,
+			maximumAttempts = maximumAttempts,
+			error = entryError,
+			candidates = #resolvePortalCandidates(),
+		})
 		log("PORTAL", entered and "Story portal entry evidence observed." or "No available Story Pod accepted the player.", {
 			attempt = attempt,
 			error = entryError,
@@ -1261,9 +1386,11 @@ local function ensureLobbyLoadout()
 		fail("LOBBY_LOADOUT", "PlayerData.EquippedTowers/Inventory.Towers did not settle before stage selection.")
 	end
 	if next(equipped) ~= nil then
+		trace("loadout ok; fallback equip not needed")
 		log("LOADOUT", "At least one equipped UUID is already verified; fallback equip skipped.", equipped)
 		return true
 	end
+	trace("loadout EMPTY; equipping one fallback unit before selection")
 
 	local candidates = {}
 	for uuid, record in next, towers do
@@ -1319,6 +1446,10 @@ local function runLobby()
 	local target = chooseLobbyTarget()
 	log("DECISION", string.format("%s / %s / %s / %s: %s",
 		target.mode, target.world, target.act, target.difficulty, target.reason), target)
+	trace("route chosen", {
+		mode = target.mode, world = target.world, act = target.act,
+		difficulty = target.difficulty, reason = target.reason,
+	})
 	publishTarget(target)
 	if Settings.dryRun == true then
 		report.status = "DRY_RUN_COMPLETE"
@@ -1648,20 +1779,26 @@ end
 
 local function run()
 	report.status = "WAITING_FOR_CONTEXT"
+	trace("route start", { placeId = game.PlaceId, userId = player.UserId })
 	local contextReady = waitUntil(function()
 		tryBindRemotes()
 		return resolvePortal() ~= nil
 			or resolveMatchRuntime() ~= nil
 			or Workspace:FindFirstChild("Towers") ~= nil
 	end, tonumber(Settings.runtimeLoadTimeout) or 20)
-	if not contextReady then fail("CONTEXT", "Neither lobby portal nor stage runtime loaded.") end
+	if not contextReady then
+		trace("CONTEXT FAILED: neither lobby portal nor stage runtime replicated")
+		fail("CONTEXT", "Neither lobby portal nor stage runtime loaded.")
+	end
 
 	-- The live Story DoorUIPart is the strongest lobby identity. Prefer it over a
 	-- stale getgc MatchRuntime left behind by an earlier place lifecycle.
 	if resolvePortal() then
+		trace("context LOBBY: Story portal is live")
 		waitForBootstrapWorkers()
 		runLobby()
 	else
+		trace("context STAGE: no lobby portal, monitoring the match")
 		runStage()
 	end
 end
@@ -1695,6 +1832,10 @@ task.spawn(function()
 		report.error = result
 		if attempt >= maximumRestarts then
 			report.status = "FAILED"
+			trace("route FATAL; no controller is watching this account any more", {
+				restarts = attempt,
+				error = tostring(result):sub(1, 220),
+			})
 			log("FATAL", "Main route stopped.", { trace = result, restarts = attempt })
 			-- The report remains FAILED (not STOPPED) while all event listeners are
 			-- disconnected so no partial controller continues acting in the background.
@@ -1705,6 +1846,11 @@ task.spawn(function()
 
 		report.status = "RESTARTING"
 		report.routeRestarts = attempt + 1
+		trace("route restarting after an error", {
+			attempt = attempt + 1,
+			maximumRestarts = maximumRestarts,
+			error = tostring(result):sub(1, 220),
+		})
 		log("SUPERVISOR", "Main route stopped on an error; restarting the route.", {
 			attempt = attempt + 1,
 			maximumRestarts = maximumRestarts,

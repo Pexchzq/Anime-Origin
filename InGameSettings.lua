@@ -24,6 +24,13 @@ local Workspace = game:GetService("Workspace")
 
 local environment = getgenv()
 
+-- Shared milestone trace. Resolved per call rather than captured at load time,
+-- because Config publishes the tracer and Auto-Execute does not guarantee order.
+local function trace(message, data)
+	local tracer = environment.AnimeOriginTrace
+	if typeof(tracer) == "function" then tracer("Settings", message, data) end
+end
+
 -- MacSploit launches enabled Auto-Execute files concurrently and does not
 -- guarantee filename order. Wait for Config.lua and LocalPlayer instead of
 -- failing during the first frames of a join/teleport.
@@ -782,9 +789,13 @@ local function run()
 	return report
 end
 
+trace("start", { placeId = game.PlaceId })
 local ok, result = xpcall(run, function(message)
 	return debug and debug.traceback and debug.traceback(tostring(message), 2) or tostring(message)
 end)
+trace(ok and tostring(typeof(result) == "table" and result.status or "COMPLETE") or "FAILED", {
+	error = not ok and tostring(result):sub(1, 220) or nil,
+})
 if environment.AnimeOriginInGameSettingsRunning == runToken then
 	environment.AnimeOriginInGameSettingsRunning = nil
 end

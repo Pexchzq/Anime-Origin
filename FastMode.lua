@@ -21,6 +21,13 @@ local HttpService = game:GetService("HttpService")
 
 local environment = getgenv()
 
+-- Shared milestone trace. Resolved per call rather than captured at load time,
+-- because Config publishes the tracer and Auto-Execute does not guarantee order.
+local function trace(message, data)
+	local tracer = environment.AnimeOriginTrace
+	if typeof(tracer) == "function" then tracer("FastMode", message, data) end
+end
+
 -- Auto-Execute tasks are concurrent in MacSploit, so alphabetical filenames do
 -- not guarantee that Config.lua wins the startup race. These bounded waits make
 -- the controller safe on both a fresh join and a place teleport.
@@ -84,6 +91,7 @@ local function publishLifecycle(status, details)
 end
 
 publishLifecycle("RUNNING", { phase = "startup" })
+trace("start", { placeId = game.PlaceId, userId = player.UserId })
 
 -- FastMode owns lobby claims and summons only. Auto-Execute also runs after a
 -- stage teleport, where lobby PlayerData/remotes do not exist and must not be
@@ -93,6 +101,7 @@ local isLobbyPlace = typeof(lobbyPlaces) == "table" and lobbyPlaces[game.PlaceId
 if not isLobbyPlace then
 	local skipped = { status = "SKIPPED_STAGE", placeId = game.PlaceId, jobId = game.JobId }
 	publishLifecycle("SKIPPED", { phase = "context", reason = "stage place" })
+	trace("SKIPPED: stage place, lobby bootstrap does not apply here")
 	if environment.AnimeOriginFastModeRunning == runToken then
 		environment.AnimeOriginFastModeRunning = nil
 	end
@@ -167,6 +176,22 @@ end
 local function fail(stage, message)
 	log("ERROR", stage .. ": " .. message)
 	error(string.format("[FastMode][%s] %s", stage, message), 0)
+end
+
+-- `parent:WaitForChild(name)` with no timeout yields FOREVER. On a host running
+-- dozens of clients ReplicatedStorage can still be replicating long after join, and
+-- a worker parked in an infinite yield never publishes another lifecycle signal --
+-- it simply stays RUNNING, which main reads as "still working" rather than "dead",
+-- so the account stands in the lobby until the bootstrap gate runs out. Bound every
+-- lookup and turn a missing remote into a reported failure main can act on at once.
+local function requireChild(parent, name)
+	local timeout = math.max(1, tonumber(Bootstrap.remoteWaitTimeout) or 30)
+	local child = parent:WaitForChild(name, timeout)
+	if not child then
+		fail("REMOTE", string.format("%s.%s did not replicate within %ss.",
+			parent:GetFullName(), tostring(name), tostring(timeout)))
+	end
+	return child
 end
 
 local function waitUntil(predicate, timeout)
@@ -285,6 +310,9 @@ local function resolvePlayerData()
 		fail("RUNTIME", "Live PlayerData was not found before the bounded lobby-load timeout.")
 	end
 	playerDataSettled = true
+	-- The single most diagnostic line this file has: binding a detached warm-up copy
+	-- instead of the live wrapper makes every later claim silently report no change.
+	trace("PlayerData bound", { source = playerDataSource, wrapper = playerDataIsWrapper })
 	debugLog("RUNTIME", "Resolved authoritative PlayerData.", {
 		source = playerDataSource,
 		wrapper = playerDataIsWrapper,
@@ -366,8 +394,8 @@ local function lockConfiguredUnits(context, beforeUUIDs)
 	local inventory = rawget(data, "Inventory")
 	local currentTowers = typeof(inventory) == "table" and rawget(inventory, "Towers") or nil
 	if typeof(currentTowers) ~= "table" then return end
-	local remote = ReplicatedStorage:WaitForChild("Remotes")
-		:WaitForChild("InventoryRemotes"):WaitForChild("InventoryFunction")
+	local remote = requireChild(requireChild(requireChild(ReplicatedStorage, "Remotes"),
+		"InventoryRemotes"), "InventoryFunction")
 
 	for uuid, record in next, currentTowers do
 		local isNew = beforeUUIDs == nil or beforeUUIDs[uuid] ~= true
@@ -549,7 +577,7 @@ end
 local state = loadState()
 
 local function redeemCodes()
-	local codesFunction = ReplicatedStorage:WaitForChild("LobbyRemotes"):WaitForChild("CodesFunction")
+	local codesFunction = requireChild(requireChild(ReplicatedStorage, "LobbyRemotes"), "CodesFunction")
 	local requestDelay = tonumber(Settings.redeemRequestDelay) or 3
 	local retryDelay = tonumber(Settings.redeemRetryDelay) or requestDelay
 	local maxAttempts = math.max(1, math.floor(tonumber(Settings.redeemMaxAttempts) or 3))
@@ -603,7 +631,7 @@ end
 
 local function claimDailyReward()
 	if not (Settings.claimRewards and Settings.claimRewards.dailyReward) then return end
-	local remote = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("RemoteEvent")
+	local remote = requireChild(requireChild(ReplicatedStorage, "Remotes"), "RemoteEvent")
 	local before = readDailyState()
 	local beforeGems = readGems()
 	log("ACTION", "Claim Daily Reward.")
@@ -624,7 +652,7 @@ end
 
 local function claimPlayTimeRewards()
 	if not (Settings.claimRewards and Settings.claimRewards.playTimeRewards) then return end
-	local remote = ReplicatedStorage:WaitForChild("LobbyRemotes"):WaitForChild("PlayTimeRewardsRemote")
+	local remote = requireChild(requireChild(ReplicatedStorage, "LobbyRemotes"), "PlayTimeRewardsRemote")
 	local pending = {}
 	local gemsBefore = readGems()
 
@@ -685,7 +713,7 @@ end
 local function claimBattlepass()
 	if not (Settings.claimRewards and Settings.claimRewards.battlepass) then return end
 	local season = tostring(Settings.battlepassSeason or "Season1")
-	local remote = ReplicatedStorage:WaitForChild("LobbyRemotes"):WaitForChild("BattlepassRemote")
+	local remote = requireChild(requireChild(ReplicatedStorage, "LobbyRemotes"), "BattlepassRemote")
 	local before = readBattlepassState(season)
 	local beforeGems = readGems()
 	log("ACTION", "Claim Battlepass " .. season .. " once.")
@@ -710,7 +738,7 @@ end
 
 local function spinDailyWheel()
 	if not (Settings.claimRewards and Settings.claimRewards.dailyWheel) then return end
-	local remote = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("DailyWheelFunction")
+	local remote = requireChild(requireChild(ReplicatedStorage, "Remotes"), "DailyWheelFunction")
 	local before = readDailyState()
 	local beforeGems = readGems()
 	log("ACTION", "Spin Daily Wheel.")
@@ -745,7 +773,7 @@ local function claimAllQuests()
 		return
 	end
 
-	local remote = ReplicatedStorage:WaitForChild("LobbyRemotes"):WaitForChild("QuestRemote")
+	local remote = requireChild(requireChild(ReplicatedStorage, "LobbyRemotes"), "QuestRemote")
 	local beforeGems = readGems()
 	log("ACTION", string.format("Claim All Quests (%d claimable).", before.claimable))
 	remote:FireServer("ClaimAllQuests")
@@ -978,7 +1006,7 @@ local function run()
 			log("VERIFY", "Configured Auto Sell state is authoritative and ready.")
 		end
 	end
-	local summonFunction = ReplicatedStorage:WaitForChild("LobbyRemotes"):WaitForChild("SummonFunction")
+	local summonFunction = requireChild(requireChild(ReplicatedStorage, "LobbyRemotes"), "SummonFunction")
 	log("STEP", string.format("[3/4] Summoning verified batches %d/%d.", state.verifiedBatches, targetBatches))
 
 	while state.verifiedBatches < targetBatches do
@@ -1094,6 +1122,10 @@ if environment.AnimeOriginFastModeRunning == runToken then
 	environment.AnimeOriginFastModeRunning = nil
 end
 environment.AnimeOriginFastModeReport = ok and result or { status = "FAILED", error = result, logFile = logFile }
+trace(ok and "COMPLETE" or "FAILED", {
+	reportStatus = ok and result.status or "FAILED",
+	error = not ok and tostring(result):sub(1, 220) or nil,
+})
 publishLifecycle(ok and "COMPLETE" or "FAILED", {
 	reportStatus = ok and result.status or "FAILED",
 	stateFile = stateFile,

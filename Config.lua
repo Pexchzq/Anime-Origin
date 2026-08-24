@@ -11,6 +11,16 @@ local Config = {
 	-- normal status lines; thrown errors remain visible for diagnosis.
 	console = {
 		statusOnly = true,
+		-- Deliberately independent of statusOnly. statusOnly exists to keep a normal
+		-- farming run quiet; this exists to make ONE F9 capture explain a whole
+		-- session, which statusOnly actively prevented -- a client that produced no
+		-- console output at all was indistinguishable from a client where the script
+		-- was never injected, where a download failed, and where a worker died.
+		--
+		-- Milestones only, never per-action logging: Roblox's console keeps a bounded
+		-- ring, and a chatty channel would push the Loader's own lines out before
+		-- anyone could read them. A full healthy run is ~30 lines.
+		diagnostics = true,
 	},
 
 	-- Confirmed Roblox place identities let Auto-Execute controllers distinguish
@@ -73,6 +83,13 @@ local Config = {
 			-- Refresh getgc during this window instead of failing on the first scan.
 			runtimeLoadTimeout = 60,
 			runtimeDiscoveryInterval = 0.5,
+			-- Budget for one ReplicatedStorage remote lookup. `WaitForChild(name)` with
+			-- no timeout yields FOREVER, and a worker parked in an infinite yield keeps
+			-- publishing nothing while its lifecycle entry stays RUNNING -- which main
+			-- reads as "still working", so the account stands in the lobby until the
+			-- bootstrap gate gives up. Every lookup is bounded and reports its own
+			-- failure instead, which main can act on immediately.
+			remoteWaitTimeout = 30,
 			-- getgc exposes both the PlayerData wrapper and its inner table, plus any
 			-- detached warm-up copies. Only the wrapper keeps receiving server writes, so
 			-- keep looking for it for this long before settling for a bare table; binding
@@ -163,6 +180,15 @@ local Config = {
 		-- catch late PlayerData without scanning hundreds of thousands of objects at 10 Hz.
 		runtimeDiscoveryInterval = 0.5,
 		transitionVerifyTimeout = 12,
+		-- A verified StartTeleport means the SERVER accepted the request, not that
+		-- Roblox moved the client. A real place transition tears this whole script
+		-- down, so still executing after this window is proof the teleport never
+		-- landed. Roblox rate-limits a host running dozens of clients
+		-- (matchmaking-api HTTP 429) and reports that through TeleportState.Failed,
+		-- which used to be counted as transition evidence -- main then set
+		-- TELEPORTING_TO_STAGE, the supervisor returned for good, and the account
+		-- stood in the lobby with a controller that had already stopped watching.
+		stageTeleportSettleTimeout = 20,
 		-- DISPROVEN, kept off. The theory was that MapSelectRemote "StartSelection"
 		-- would be accepted without walking into a Pod, since main.lua fires that remote
 		-- either way. It was tried and the server refused it 26 times out of 26, with no
@@ -214,9 +240,13 @@ local Config = {
 			-- progress look identical and main waits the full timeout above -- five
 			-- minutes of an account standing in the lobby before it fails too.
 			--
-			-- Must stay above the workers' own 30s Config/LocalPlayer waits, so that a
-			-- worker which is merely slow to start is never called dead.
-			startupGrace = 45,
+			-- Must stay above the workers' own startup waits, so that a worker which is
+			-- merely slow to start is never called dead. Those waits are SEQUENTIAL --
+			-- waitForLocalPlayer(30) then waitForAnimeOriginConfig(30) -- so the real
+			-- worst case is 60s, not 30s. At 45s a loaded host could declare a healthy
+			-- worker dead while it was still inside its own documented budget, burning
+			-- a supervised route restart for nothing.
+			startupGrace = 75,
 			requiredTasks = { "FastMode", "UnitProgression" },
 			-- Both workers must finish before routing. Only FastMode is fatal because
 			-- UnitProgression is optional account enrichment (fuse/shop/feed), not a
@@ -320,6 +350,11 @@ local Config = {
 		-- formula and a PlayerData container.
 		runtimeLoadTimeout = 60,
 		runtimeDiscoveryInterval = 0.5,
+		-- See the identical key in fastGems.bootstrap: an unbounded WaitForChild is
+		-- how this file parked at RUNNING forever while main burned its whole gate.
+		-- These lookups run at module scope, before run() and its xpcall exist, so a
+		-- bounded failure here is the only way the worker can report itself dead.
+		remoteWaitTimeout = 30,
 		minimumGCSnapshotSize = 1000,
 		-- Every request is already verified from PlayerData; this delay only yields
 		-- briefly to replication instead of idling a third of a second per action.
@@ -464,6 +499,10 @@ local Config = {
 		-- lobby place AutoPlay becomes idle immediately and waits for teleport.
 		startupContextTimeout = 60,
 		runtimeDiscoveryInterval = 0.5,
+		-- See the identical key in fastGems.bootstrap. AutoPlay is not a bootstrap
+		-- gate, so an infinite yield here does not strand the route -- it strands the
+		-- match instead: the account teleports in and never places a unit.
+		remoteWaitTimeout = 30,
 		maximumTeamSlots = 6,
 		minimumDamageSlots = 3,
 		-- Guarantee an affordable starter among the first three always-unlocked
@@ -687,6 +726,32 @@ local Config = {
 }
 
 local environment = getgenv()
+
+-- One shared trace channel for every controller, published here because Config is
+-- the only file guaranteed to run before all of them. The Loader keeps its own copy
+-- of the same format for the lines it emits before this file exists, and hands over
+-- its start time through AnimeOriginTraceEpoch so both halves share one clock.
+--
+-- The sequence number matters as much as the text: Roblox interleaves output from
+-- every client thread, so without it a captured console cannot be put back in order.
+local traceEpoch = tonumber(environment.AnimeOriginTraceEpoch) or os.clock()
+environment.AnimeOriginTraceEpoch = traceEpoch
+local traceSequence = tonumber(environment.AnimeOriginTraceSequence) or 0
+
+function environment.AnimeOriginTrace(tag, message, data)
+	if Config.console.diagnostics ~= true then return end
+	traceSequence += 1
+	environment.AnimeOriginTraceSequence = traceSequence
+	local suffix = ""
+	if data ~= nil then
+		local ok, encoded = pcall(function()
+			return game:GetService("HttpService"):JSONEncode(data)
+		end)
+		suffix = " " .. (ok and encoded or tostring(data))
+	end
+	print(string.format("[AO][%03d][%6.1fs][%s] %s%s",
+		traceSequence, os.clock() - traceEpoch, tostring(tag), tostring(message), suffix))
+end
 
 -- Preserve worker signals when Config.lua is re-run in the same server, but never
 -- carry completion from an old JobId into a newly joined lobby or stage.

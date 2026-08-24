@@ -30,6 +30,13 @@ local HttpService = game:GetService("HttpService")
 
 local environment = getgenv()
 
+-- Shared milestone trace. Resolved per call rather than captured at load time,
+-- because Config publishes the tracer and Auto-Execute does not guarantee order.
+local function trace(message, data)
+	local tracer = environment.AnimeOriginTrace
+	if typeof(tracer) == "function" then tracer("AutoPlay", message, data) end
+end
+
 -- MacSploit may inject AutoPlay before Config.lua on a new place lifecycle.
 -- Bounded waits remove that ordering dependency while still surfacing a clear
 -- error if Auto-Execute was configured without the central config file.
@@ -179,6 +186,21 @@ local function fail(stage, message)
 	log("ERROR", stage .. ": " .. message)
 	saveReport(stage .. ": " .. message)
 	error(string.format("[AutoPlay][%s] %s", stage, message), 0)
+end
+
+-- `parent:WaitForChild(name)` with no timeout yields FOREVER. AutoPlay is not a
+-- bootstrap gate, so an infinite yield here does not strand the route -- it strands
+-- the MATCH: the account teleports into a stage and then never places or upgrades a
+-- unit, with nothing in the log to say why. On a host running dozens of clients the
+-- stage's remotes routinely replicate late. Bound every lookup instead.
+local function requireChild(parent, name)
+	local timeout = math.max(1, tonumber(Settings.remoteWaitTimeout) or 30)
+	local child = parent:WaitForChild(name, timeout)
+	if not child then
+		fail("REMOTE", string.format("%s.%s did not replicate within %ss.",
+			parent:GetFullName(), tostring(name), tostring(timeout)))
+	end
+	return child
 end
 
 ensureFolder()
@@ -973,9 +995,8 @@ local function createTowerObserver(matchRuntime)
 	end
 
 	observer:refresh(matchRuntime)
-	local remote = ReplicatedStorage:WaitForChild("LobbyRemotes")
-		:WaitForChild("TowerHandlerRemotes")
-		:WaitForChild("TowerHandlerRemote")
+	local remote = requireChild(requireChild(requireChild(ReplicatedStorage, "LobbyRemotes"),
+		"TowerHandlerRemotes"), "TowerHandlerRemote")
 	observer.connection = remote.OnClientEvent:Connect(function(action, uuidOrInfo, patch)
 		if action == "CreateNewTower" and typeof(uuidOrInfo) == "table" then
 			observer:merge(nil, uuidOrInfo, "CreateNewTower")
@@ -1536,6 +1557,7 @@ local function run()
 	local lobbyPlaces = Config.runtimePlaces and Config.runtimePlaces.lobby
 	if typeof(lobbyPlaces) == "table" and lobbyPlaces[game.PlaceId] == true then
 		report.status = "IDLE_LOBBY"
+		trace("IDLE_LOBBY: waiting for the stage teleport before acting")
 		log("CONTEXT", "Lobby detected; AutoPlay is idle until the stage teleport.", {
 			placeId = game.PlaceId,
 		})
@@ -1543,7 +1565,8 @@ local function run()
 		return report
 	end
 
-	local inventoryRemote = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("InventoryRemotes"):WaitForChild("InventoryRemote")
+	local inventoryRemote = requireChild(requireChild(requireChild(ReplicatedStorage, "Remotes"),
+		"InventoryRemotes"), "InventoryRemote")
 	local requiredDamage = tonumber(Settings.minimumDamageSlots) or 3
 	local expectedDesired = {}
 	-- Owned by the supervisor rather than by this call. run() that errors never
@@ -1832,13 +1855,13 @@ local function run()
 	report.gameplay.matchRuntimeSource = matchRuntimeSource
 	log("RUNTIME", "Verified MatchRuntime resolved.", { source = report.gameplay.matchRuntimeSource })
 
-	local towerFunction = ReplicatedStorage:WaitForChild("LobbyRemotes")
-		:WaitForChild("TowerHandlerRemotes")
-		:WaitForChild("TowerHandlerFunction")
-	local actRemote = ReplicatedStorage:WaitForChild("LobbyRemotes"):WaitForChild("ActRemoteEvent")
+	local lobbyRemotes = requireChild(ReplicatedStorage, "LobbyRemotes")
+	local towerFunction = requireChild(requireChild(lobbyRemotes, "TowerHandlerRemotes"),
+		"TowerHandlerFunction")
+	local actRemote = requireChild(lobbyRemotes, "ActRemoteEvent")
 	-- TeleportToLobby is the verified emergency reset for a replay scene that never
 	-- removes its old server towers. It is deliberately separate from ready voting.
-	local genericRemote = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("RemoteEvent")
+	local genericRemote = requireChild(requireChild(ReplicatedStorage, "Remotes"), "RemoteEvent")
 	local observer = createTowerObserver(matchRuntime)
 	table.insert(connections, observer.connection)
 	local function renderConfiguredPlacementPreview()
@@ -2607,6 +2630,9 @@ for attempt = 0, maximumRestarts do
 	releaseGCObjects()
 	task.wait(restartDelay)
 end
+trace(ok and tostring(typeof(result) == "table" and result.status or "COMPLETE") or "FAILED", {
+	error = not ok and tostring(result):sub(1, 220) or nil,
+})
 if environment.AnimeOriginAutoPlayRunning == runToken then
 	environment.AnimeOriginAutoPlayRunning = nil
 end

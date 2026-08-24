@@ -263,6 +263,41 @@ Probes/MainFlowStateProbe.lua
 `AnimeOrigin/MainFlowProbe_trace.jsonl` ใน workspace ของ executor หยุดด้วย
 `AnimeOriginMainFlowProbe.stop()`
 
+## การวินิจฉัยจาก F9
+
+`Config.console.statusOnly = true` ทำให้รอบปกติเงียบ ซึ่งดีสำหรับการฟาร์ม แต่แปลว่า
+client ที่ executor ไม่ inject, client ที่โหลดไฟล์พัง และ client ที่ทำงานปกติ
+**ให้คอนโซลว่างเปล่าเหมือนกันหมด** จึงมี trace channel แยกที่ไม่สนใจ `statusOnly`:
+
+```lua
+Config.console.diagnostics = true -- ค่าเริ่มต้น
+```
+
+รูปแบบบรรทัด — เลข sequence สำคัญพอๆ กับข้อความ เพราะ Roblox สลับเอาต์พุตจากหลาย
+thread การจับภาพคอนโซลจึงเรียงลำดับกลับไม่ได้ถ้าไม่มีมัน:
+
+```text
+[AO][007][  12.4s][LOADER] download 4/8 main.lua ok {"kb":"73.8","seconds":"0.31","attempts":1}
+[AO][019][  31.2s][Main] bootstrap gate waiting {"FastMode":"RUNNING","UnitProgression":"RUNNING"}
+```
+
+พิมพ์เฉพาะ **milestone** ไม่ใช่ทุก action เพราะคอนโซลของ Roblox เป็น ring ที่มีขอบเขต
+ถ้าพิมพ์ถี่ บรรทัดของ Loader จะถูกดันหายก่อนมีคนได้อ่าน รอบที่สมบูรณ์ดีอยู่ที่ ~35 บรรทัด
+
+| tag | บอกอะไร |
+| --- | --- |
+| `LOADER` | attach, capability ของ executor, teleport queue, การรอเกมโหลด, jitter, ทุกไฟล์ที่ดาวน์โหลด (KB/วินาที/จำนวนครั้งที่ retry), `ready:` หรือ `ABORT` |
+| `FastMode` / `UnitProgress` | start, การผูก PlayerData, การรอ dependency, สถานะ terminal |
+| `Main` | context LOBBY/STAGE, ทุกการเปลี่ยนของ bootstrap gate, ด่านที่เลือก, การเข้า Pod, `StartSelection`, การลงจอดของเทเลพอร์ต, restart/FATAL |
+| `Settings` / `AutoPlay` / `Optimizer` / `LogStats` | start และสถานะ terminal |
+
+ปิดได้ด้วย `Config.console.diagnostics = false` และปิดเฉพาะฝั่ง Loader ด้วย
+`getgenv().AnimeOriginLoaderTrace = false`
+
+Loader retry การดาวน์โหลดที่พลาดแบบมี backoff (`AnimeOriginLoaderDownloadRetries`
+ค่าเริ่มต้น 3) เพราะ `game:HttpGet` **raise** เมื่อพลาด และเดิมเรียกแบบไม่มี pcall
+ที่ module scope — response เดียวที่โดน throttle เคยฆ่า client ทั้งตัวไปทั้ง session
+
 ## Tests
 
 `Tests/` เป็น Python ล้วน ไม่รันเกม แบ่งเป็นสองชนิด:

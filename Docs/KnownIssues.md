@@ -1,6 +1,6 @@
 # Known Issues
 
-สถานะ ณ commit `bde3928` ทุกข้อในนี้ตรวจกับซอร์สจริงแล้ว ไม่ใช่การคาดเดา
+สถานะ ณ commit `0bbb8bc` + ชุดแก้ "ค้างหน้าล็อบบี้" ทุกข้อในนี้ตรวจกับซอร์สจริงแล้ว ไม่ใช่การคาดเดา
 ถ้าแก้ข้อไหนแล้วให้ลบออกจากไฟล์นี้ อย่าปล่อยให้เหลือค้าง
 
 ---
@@ -15,8 +15,14 @@
 | --- | --- | --- |
 | `main.lua` `enterStoryPortal` | Pod ยังไม่ replicate → `return` ทันที | รอภายใน `occupiedPortalWaitTimeout` (20s) |
 | `main.lua` `tryEnterStoryPortal` | `CharacterAdded:Wait()` ไม่มี timeout | `characterWaitTimeout` (10s) |
-| `main.lua` `waitForBootstrapWorkers` | worker ตายเงียบ = PENDING ตลอด → รอ 300s | `startupGrace` (45s) → นับเป็น FAILED |
+| `main.lua` `waitForBootstrapWorkers` | worker ตายเงียบ = PENDING ตลอด → รอ 300s | `startupGrace` → นับเป็น FAILED |
 | `Loader.lua` | รอเกมโหลดก่อน arm `queue_on_teleport` | arm ก่อน แล้วรอแบบมีขอบเขต 120s |
+| `main.lua` `OnTeleport` | นับ `TeleportState.Failed` เป็นหลักฐานว่าเทเลพอร์ตสำเร็จ | แยก `teleportFailureGeneration` ออก + settle watchdog `stageTeleportSettleTimeout` (20s) |
+| FastMode / UnitProgression / AutoPlay | `WaitForChild(name)` ไม่มี timeout 24 จุด | `requireChild()` ผูกกับ `remoteWaitTimeout` (30s) แล้วรายงาน FAILED |
+| `main.lua` gate timeout | เรียก `fail()` เสมอ ไม่ดู `fatalTasks` | timeout ที่เหลือแต่ worker non-fatal → route ต่อได้ |
+| `main.lua` gate budget | ทุก route restart ได้ 300s ใหม่ → 4×300s | `gateStartedAt` ผูกครั้งเดียวต่อล็อบบี้ |
+| `Loader.lua` worker error | error ดิบ = lifecycle ค้าง `RUNNING` ตลอดไป | Loader publish `FAILED` ให้ worker ที่ raise ก่อน publish terminal |
+| `startupGrace` | `45s` — ต่ำกว่า worst case จริงของ worker (30+30) | `75s` |
 
 **ตัวที่หนักที่สุดคือข้อแรก** — Pod อยู่ใต้ `MainFolder.Lobby.MapSelectors.Story` ซึ่งบนเครื่อง
 ที่โหลดหนักจะยัง replicate ไม่เสร็จในไม่กี่วินาทีแรกหลัง join โค้ดเดิม `return` ทันที ทำให้
@@ -27,15 +33,23 @@
 
 ## บั๊กที่ยืนยันแล้วและยังไม่แก้
 
-### worker ที่ค้างกลางทางยังตรวจไม่ได้
+### worker ที่ค้างใน infinite loop ยังตรวจไม่ได้ (แคบลงมากแล้ว)
 
-`startupGrace` จับได้เฉพาะ worker ที่ **ตายก่อนจะ publish อะไรเลย** ถ้า worker publish
-`RUNNING` แล้วค่อยค้าง (infinite loop) หรือตายด้วย runtime error ดิบระหว่างบรรทัด 124–1439
-สถานะจะค้างที่ `RUNNING` ซึ่งไม่ terminal → main ยังรอครบ 300s เหมือนเดิม
+`RUNNING` ที่ไม่มีวันเปลี่ยนเคยเกิดได้ 3 ทาง ตอนนี้ปิดไป 2:
 
-**แก้ยังไง**: ให้ฟังก์ชัน `log()` ของแต่ละ worker ประทับ heartbeat ลง lifecycle entry แล้วให้
-main ถือว่า `RUNNING` ที่ heartbeat ค้างเกิน N วินาที = ตาย เป็นการแก้ที่ครอบคลุมทั้ง
-"ตาย" และ "ค้าง" แต่ต้องแตะ log path ของทั้งสอง worker จึงเลื่อนไว้ก่อนจนกว่าชุดนี้จะยืนยันแล้ว
+| ทาง | สถานะ |
+| --- | --- |
+| infinite yield จาก `WaitForChild` ไม่มี timeout | **ปิดแล้ว** — bounded ทั้ง 24 จุด + เกตบังคับ |
+| error ดิบก่อน publish terminal | **ปิดแล้ว** — `Loader.lua` publish `FAILED` แทน |
+| infinite loop จริงๆ ในโค้ด worker | ยังตรวจไม่ได้ |
+
+ทางที่สามยังเหลือ แต่ตอนนี้ไม่มี `while true` ในไฟล์ที่รันจริงเลยสักไฟล์ (ยืนยันด้วย grep)
+จึงไม่ใช่ทางที่เกิดจริงในซอร์สปัจจุบัน
+
+**ถ้าจะปิดให้ครบ**: ให้ `log()` ของแต่ละ worker ประทับ heartbeat ลง lifecycle entry แล้วให้
+main ถือว่า `RUNNING` ที่ heartbeat ค้างเกิน N วินาที = ตาย ข้อควรระวังคือ worker มีช่วงเงียบ
+ที่ถูกต้องตามกฎอยู่จริง (`waitForFastModeDependency` เงียบได้ถึง 300s, การรอ PlayerData 60s)
+จุดพวกนั้นต้องแตะ heartbeat เองไม่งั้นจะกลายเป็น false positive ที่ฆ่า worker ที่ยังดีอยู่
 
 ### `Optimizer.lua:569` — `and false or` ทำให้ `cleanupHiddenGui` ไม่ทำงานเลย
 
@@ -90,7 +104,16 @@ cleanup ให้คงซ่อนไว้" ไม่เคยมีผล —
 ### Loader disk cache
 
 54 clients × 8 ไฟล์ต่อการ teleport ≈ **8,600 requests/ชั่วโมง** ไปที่ GitHub
+(392.6 KB ต่อ client ต่อการ join = 20.7 MB ต่อหนึ่งระลอก)
 ควรแคชลงดิสก์แล้วดาวน์โหลดใหม่เฉพาะเมื่อไฟล์เปลี่ยน
+
+**ลงไปแล้วบางส่วน**: retry + backoff + ปฏิเสธ body ว่าง (`game:HttpGet` raise เมื่อพลาด
+และเดิมเรียกที่ module scope โดยไม่มี pcall — response เดียวที่โดน throttle ฆ่า client
+ทั้งตัวเงียบๆ ไปทั้ง session) แต่ retry ลดความเสียหาย ไม่ได้ลดจำนวน request
+
+**ยังไม่ทำ** disk cache ตัวจริง เพราะต้องรู้ก่อนว่าการดาวน์โหลดพลาดจริงหรือไม่ —
+trace `[AO][LOADER] download i/8 ... attempts=N` ตอบข้อนี้ได้จาก F9 รอบเดียว
+ถ้า `attempts` เป็น 1 ตลอด แปลว่า cache เป็นแค่การประหยัด ไม่ใช่การแก้บั๊ก
 
 ### แชร์ getgc snapshot ระหว่าง controller
 

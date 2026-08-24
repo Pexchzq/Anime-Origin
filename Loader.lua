@@ -4,10 +4,52 @@
 	The loader keeps the same dependency order as the verified MacSploit
 	Auto-Execute setup. It also queues itself before a place transition so the
 	lobby and in-stage controllers are rebuilt against the new Roblox runtime.
+
+	Every stage below announces itself on the [AO][LOADER] trace channel. That is
+	not decoration: this file used to contain zero print statements, so a client
+	where the executor never injected, a client whose Config download failed, and a
+	client that loaded perfectly all produced exactly the same empty F9 console.
+	One captured console must be able to say which of those happened.
 ]]
 
 local RAW_ROOT = "https://raw.githubusercontent.com/Pexchzq/Anime-Origin/main/"
 local LOADER_URL = RAW_ROOT .. "Loader.lua"
+
+local environment = getgenv()
+
+-- Config publishes the shared tracer, but the lines below happen before Config
+-- exists. Keep a local copy in the same format and hand the epoch over, so the
+-- Loader's half and the controllers' half of a capture share one clock and one
+-- sequence counter.
+local traceEpoch = os.clock()
+environment.AnimeOriginTraceEpoch = traceEpoch
+environment.AnimeOriginTraceSequence = tonumber(environment.AnimeOriginTraceSequence) or 0
+
+local function trace(message, data)
+	if environment.AnimeOriginLoaderTrace == false then return end
+	environment.AnimeOriginTraceSequence += 1
+	local suffix = ""
+	if data ~= nil then
+		local ok, encoded = pcall(function()
+			return game:GetService("HttpService"):JSONEncode(data)
+		end)
+		suffix = " " .. (ok and encoded or tostring(data))
+	end
+	print(string.format("[AO][%03d][%6.1fs][LOADER] %s%s",
+		environment.AnimeOriginTraceSequence, os.clock() - traceEpoch, tostring(message), suffix))
+end
+
+trace("attached", {
+	placeId = game.PlaceId,
+	jobId = game.JobId,
+	-- Executor capability matters more than executor name here: every failure mode
+	-- below is a missing capability, and a capture that omits them cannot be judged.
+	httpGet = typeof(game.HttpGet) == "function",
+	loadstring = typeof(loadstring) == "function",
+	getgc = typeof(getgc) == "function",
+	writefile = typeof(writefile) == "function",
+	firetouchinterest = typeof(firetouchinterest) == "function",
+})
 
 -- Arm the teleport queue FIRST, before anything below can yield. Every wait after
 -- this point is a window in which a place transition would otherwise drop the
@@ -19,10 +61,15 @@ local queueTeleport = queue_on_teleport
 	or (syn and syn.queue_on_teleport)
 	or (fluxus and fluxus.queue_on_teleport)
 if typeof(queueTeleport) == "function" then
-	pcall(queueTeleport, string.format(
+	local queued = pcall(queueTeleport, string.format(
 		'loadstring(game:HttpGet(%q, true), "AnimeOrigin.Loader")()',
 		LOADER_URL
 	))
+	trace(queued and "teleport queue armed" or "teleport queue call FAILED")
+else
+	-- Worth a line of its own: without it the script silently stops existing after
+	-- the first stage teleport, which looks exactly like the script never working.
+	trace("teleport queue UNAVAILABLE on this executor; the script will not survive a teleport")
 end
 
 -- Auto-Execute fires the moment the client attaches, which on a machine running
@@ -36,12 +83,18 @@ end
 -- all -- each controller has its own runtimeLoadTimeout and will keep looking for
 -- live state, whereas an unbounded wait here produces a client that is attached
 -- and permanently silent.
+local loadWaitStartedAt = os.clock()
+local loadTimeout = tonumber(environment.AnimeOriginLoaderLoadTimeout) or 120
 if not game:IsLoaded() then
-	local loadDeadline = os.clock() + (tonumber(getgenv().AnimeOriginLoaderLoadTimeout) or 120)
+	local loadDeadline = os.clock() + loadTimeout
 	repeat
 		task.wait(0.2)
 	until game:IsLoaded() or os.clock() >= loadDeadline
 end
+trace(game:IsLoaded() and "game loaded" or "game load TIMED OUT; continuing anyway", {
+	waited = string.format("%.1fs", os.clock() - loadWaitStartedAt),
+	timeout = loadTimeout,
+})
 
 -- Every client on this machine reaches this point at the same moment, then all of
 -- them download eight files and walk the whole Lua heap at once. That thundering
@@ -52,9 +105,11 @@ end
 --
 -- Raise it on a host running many clients:
 --     getgenv().AnimeOriginLoaderJitter = 20
-local jitter = tonumber(getgenv().AnimeOriginLoaderJitter) or 8
+local jitter = tonumber(environment.AnimeOriginLoaderJitter) or 8
 if jitter > 0 then
-	task.wait(math.random() * jitter)
+	local delay = math.random() * jitter
+	trace(string.format("startup jitter %.1fs", delay))
+	task.wait(delay)
 end
 
 local workerFiles = {
@@ -67,34 +122,127 @@ local workerFiles = {
 	"logstats.lua",
 }
 
-local function downloadChunk(fileName)
+-- 8 files x ~390 KB per join, on a host running dozens of clients, is thousands of
+-- requests an hour against one IP. GitHub rate-limits that, and `game:HttpGet`
+-- RAISES on failure -- so a single transient response used to kill the entire
+-- client for the rest of the session, silently, with Config.lua the most damaging
+-- place for it to happen because nothing at all runs after that.
+--
+-- Retry with backoff, and say so on the trace channel. A capture must show whether
+-- a file needed retries even when the run eventually succeeded, because that is the
+-- early warning that the host is being throttled.
+local maximumAttempts = math.max(1, tonumber(environment.AnimeOriginLoaderDownloadRetries) or 3)
+local retryBackoff = math.max(0, tonumber(environment.AnimeOriginLoaderRetryBackoff) or 2)
+
+local function downloadSource(fileName)
 	local url = RAW_ROOT .. fileName
-	local source = game:HttpGet(url, true)
+	local lastError
+	for attempt = 1, maximumAttempts do
+		local startedAt = os.clock()
+		local ok, result = pcall(game.HttpGet, game, url, true)
+		if ok and typeof(result) == "string" and #result > 0 then
+			return result, attempt, os.clock() - startedAt
+		end
+		-- An empty 200 is a real failure mode behind a throttling proxy and would
+		-- otherwise compile into an empty chunk that does nothing at all.
+		lastError = ok and "empty response body" or tostring(result)
+		trace(string.format("download %s FAILED (attempt %d/%d)", fileName, attempt, maximumAttempts),
+			{ error = lastError })
+		if attempt < maximumAttempts then
+			task.wait(retryBackoff * attempt)
+		end
+	end
+	return nil, maximumAttempts, 0, lastError
+end
+
+local function downloadChunk(fileName, index, total)
+	local source, attempts, elapsed, downloadError = downloadSource(fileName)
+	if not source then
+		trace(string.format("ABORT at %d/%d %s: download failed after %d attempts",
+			index, total, fileName, maximumAttempts), { error = downloadError })
+		error(string.format("[AnimeOriginLoader] Download failed for %s: %s",
+			fileName, tostring(downloadError)), 0)
+	end
 	local chunk, compileError = loadstring(source, "AnimeOrigin." .. fileName)
 	if not chunk then
+		trace(string.format("ABORT at %d/%d %s: compile failed", index, total, fileName),
+			{ error = tostring(compileError) })
 		error(string.format("[AnimeOriginLoader] Compile failed for %s: %s", fileName, tostring(compileError)), 0)
 	end
+	trace(string.format("download %d/%d %s ok", index, total, fileName), {
+		kb = string.format("%.1f", #source / 1024),
+		seconds = string.format("%.2f", elapsed),
+		-- Only interesting when > 1, but always present so a capture can be diffed
+		-- across clients to see which hosts are being throttled hardest.
+		attempts = attempts,
+	})
 	return chunk
 end
 
 -- Config publishes the shared table and must complete first. Every remaining
 -- controller is started in its own task, matching separate Auto-Execute files;
 -- a long-running AutoPlay loop therefore cannot block Optimizer or logstats.
-local configChunk = downloadChunk("Config.lua")
+local totalFiles = #workerFiles + 1
+local configChunk = downloadChunk("Config.lua", 1, totalFiles)
 local configOk, configError = pcall(configChunk)
 if not configOk then
+	trace("ABORT: Config.lua raised on execution", { error = tostring(configError) })
 	error("[AnimeOriginLoader] Config.lua failed: " .. tostring(configError), 0)
 end
+trace("Config.lua executed")
 
+-- A worker publishes RUNNING early, then runs hundreds of lines of module-scope
+-- initialisation before its own xpcall exists. A raw error in that window --
+-- a failed assert, an index into a folder that has not replicated -- unwinds past
+-- every publish site the worker has, so nothing terminal is ever written and its
+-- lifecycle entry stays RUNNING forever. main.lua cannot distinguish that from a
+-- worker that is merely slow, so it waits out the whole bootstrap gate and the
+-- account stands in the lobby.
+--
+-- The Loader is the one place that sees every such failure, so it reports them.
+-- Only a non-terminal entry is overwritten: a worker that already published its own
+-- FAILED (with a real stage and message) keeps that more specific record.
+local function publishWorkerFailure(fileName, runtimeError)
+	local taskName = fileName:gsub("%.lua$", "")
+	local lifecycle = environment.AnimeOriginLifecycle
+	if typeof(lifecycle) ~= "table" or lifecycle.jobId ~= game.JobId then return end
+	if typeof(lifecycle.tasks) ~= "table" then return end
+	local entry = lifecycle.tasks[taskName]
+	local status = typeof(entry) == "table" and tostring(entry.status) or nil
+	if status == "COMPLETE" or status == "SKIPPED" or status == "FAILED" then return end
+	lifecycle.tasks[taskName] = {
+		status = "FAILED",
+		updatedAt = os.time(),
+		userId = entry and entry.userId or (game:GetService("Players").LocalPlayer
+			and game:GetService("Players").LocalPlayer.UserId or nil),
+		details = {
+			phase = "loader",
+			error = tostring(runtimeError),
+			reason = "the worker raised before it could publish a terminal signal",
+		},
+	}
+end
+
+-- Downloads stay sequential so one throttled response cannot be mistaken for eight,
+-- but each worker RUNS in its own task: a long AutoPlay loop must not delay the
+-- download of Optimizer and logstats behind it.
 for index, fileName in ipairs(workerFiles) do
-	local chunk = downloadChunk(fileName)
+	local chunk = downloadChunk(fileName, index + 1, totalFiles)
 	task.spawn(function()
 		local ok, runtimeError = pcall(chunk)
 		if not ok then
+			pcall(publishWorkerFailure, fileName, runtimeError)
+			trace(string.format("worker %s RAISED", fileName), { error = tostring(runtimeError) })
 			error(string.format("[AnimeOriginLoader] Runtime failed at worker %d/%d %s: %s",
 				index, #workerFiles, fileName, tostring(runtimeError)), 0)
 		end
 	end)
 end
+
+-- The line that says the Loader itself finished its job. Anything wrong after this
+-- point belongs to a controller, and the trace tag on the next line will name it.
+trace(string.format("ready: %d/%d files loaded", totalFiles, totalFiles), {
+	elapsed = string.format("%.1fs", os.clock() - traceEpoch),
+})
 
 return true

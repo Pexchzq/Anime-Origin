@@ -39,6 +39,41 @@ def fail(message: str, failures: list[str]) -> None:
     print(f"[LagResilience][FAIL] {message}")
 
 
+def check_no_unbounded_wait_for_child(failures: list[str]) -> None:
+    """`parent:WaitForChild(name)` with no second argument yields FOREVER, exactly
+    like `signal:Wait()` -- but the check above cannot see it, because the method
+    name differs and it always carries an argument. That blind spot let 24 unbounded
+    lookups survive a round of fixes that reported PASS.
+
+    The consequence is worse than a parked thread. FastMode and UnitProgression
+    publish RUNNING before these lookups, so a worker yielding forever on a remote
+    that has not replicated keeps its lifecycle entry at RUNNING permanently. main
+    reads RUNNING as "still working" rather than "dead", waits out the entire
+    bootstrap gate, and the account stands in the lobby -- which is precisely the
+    symptom this gate exists to prevent.
+
+    Requiring the timeout argument is the whole rule: what a caller does with the
+    nil return is its own business, and the surrounding code proves that separately.
+    """
+    pattern = re.compile(r":\s*WaitForChild\s*\(([^)]*)\)")
+    for name in RUNTIME_FILES:
+        source = (ROOT / name).read_text(encoding="utf-8")
+        for line_number, line in enumerate(source.splitlines(), start=1):
+            if line.lstrip().startswith("--"):
+                continue
+            for match in pattern.finditer(line):
+                # A timeout is the second argument. Instance names cannot contain a
+                # comma, so a top-level comma is a reliable arity test here.
+                if "," in match.group(1):
+                    continue
+                fail(
+                    f"{name}:{line_number} calls `{match.group(0).strip()}` with no timeout; "
+                    f"an instance that never replicates parks the worker at RUNNING forever "
+                    f"and main then burns its whole bootstrap gate waiting for it",
+                    failures,
+                )
+
+
 def check_no_unbounded_wait(failures: list[str]) -> None:
     """`signal:Wait()` has no timeout; if the signal never fires the thread parks
     forever. Two of these were live: Loader's `game.Loaded:Wait()` (which also
@@ -100,8 +135,10 @@ def check_bootstrap_detects_silent_death(failures: list[str]) -> None:
     if not re.search(r"^\s*startupGrace\s*=\s*\d+\s*,", config, re.MULTILINE):
         fail("Config.main.bootstrapGate.startupGrace is missing", failures)
 
+    # Any indentation: the timeout fail() now sits inside a fatal-task guard rather
+    # than at the top level of the function.
     body = re.search(
-        r"local function waitForBootstrapWorkers\(\)(.*?)\n\tfail\(\"BOOTSTRAP\"",
+        r"local function waitForBootstrapWorkers\(\)(.*?)\n\s*fail\(\"BOOTSTRAP\"",
         source,
         re.S,
     )
@@ -128,7 +165,11 @@ def check_bootstrap_detects_silent_death(failures: list[str]) -> None:
     # declared dead while it is still legitimately waiting for Config/LocalPlayer.
     grace = re.search(r"^\s*startupGrace\s*=\s*(\d+)\s*,", config, re.MULTILINE)
     if grace:
-        worker_startup_timeout = 30  # waitForConfig / waitForLocalPlayer default
+        # waitForLocalPlayer(30) and waitForAnimeOriginConfig(30) run SEQUENTIALLY,
+        # so the worst case a healthy worker can spend before publishing anything is
+        # their sum. Comparing against one of them let startupGrace sit at 45s, where
+        # a loaded host could declare a worker dead inside its own documented budget.
+        worker_startup_timeout = 60
         if int(grace.group(1)) <= worker_startup_timeout:
             fail(
                 f"startupGrace = {grace.group(1)}s is not above the workers' own "
@@ -136,6 +177,173 @@ def check_bootstrap_detects_silent_death(failures: list[str]) -> None:
                 f"worker would be reported dead",
                 failures,
             )
+
+
+def check_gate_timeout_respects_fatal_tasks(failures: list[str]) -> None:
+    """Config marks UnitProgression non-fatal on purpose: unit leveling is account
+    enrichment, not a routing prerequisite. That policy was applied only to a
+    self-reported FAILED, while the gate's own timeout called fail() unconditionally
+    -- so a merely slow UnitProgression killed the route even after FastMode had
+    reported COMPLETE, and the account stood in the lobby for nothing.
+
+    A timeout is the same evidence as a reported failure (the worker did not
+    finish), so it has to go through the same fatal / non-fatal decision."""
+    source = (ROOT / "main.lua").read_text(encoding="utf-8")
+
+    # Scope to the gate first: `until os.clock() >= deadline` also ends waitUntil,
+    # which appears earlier in the file and would match instead.
+    gate = re.search(
+        r"local function waitForBootstrapWorkers\(\)(.*?)\nend\n", source, re.S
+    )
+    tail = re.search(
+        r"until os\.clock\(\) >= deadline(.*)", gate.group(1), re.S
+    ) if gate else None
+    if not tail:
+        fail("waitForBootstrapWorkers timeout path was not found", failures)
+        return
+    text = tail.group(1)
+
+    if "fatalTasks" not in text:
+        fail(
+            "the bootstrap gate's timeout path ignores fatalTasks; a non-fatal worker "
+            "that is merely slow must not stop map selection",
+            failures,
+        )
+    if "return true" not in text:
+        fail(
+            "the bootstrap gate's timeout path has no way to continue routing; a "
+            "timeout on non-fatal workers only must not be fatal",
+            failures,
+        )
+
+
+def check_gate_budget_survives_route_restart(failures: list[str]) -> None:
+    """run() is re-entered by the supervisor after every route error. A gate deadline
+    computed inside the function handed each attempt a fresh full budget, so a worker
+    stuck at a non-terminal status cost maximumRouteRestarts x timeout of an account
+    standing still -- and since restarting main never restarts the workers, every
+    attempt re-observed the same stuck entry. The anchor must outlive one call."""
+    source = (ROOT / "main.lua").read_text(encoding="utf-8")
+
+    if not re.search(r"^local gateStartedAt\b", source, re.MULTILINE):
+        fail(
+            "gateStartedAt is not anchored outside waitForBootstrapWorkers; each "
+            "supervised restart would receive a fresh bootstrap budget",
+            failures,
+        )
+    if not re.search(r"gateStartedAt\s*=\s*gateStartedAt\s+or\s+os\.clock\(\)", source):
+        fail(
+            "gateStartedAt is reset on every gate entry; the bootstrap budget must be "
+            "consumed once per lobby, not once per supervised attempt",
+            failures,
+        )
+
+
+def check_failed_teleport_is_not_evidence(failures: list[str]) -> None:
+    """Player.OnTeleport reports a FAILED teleport through the same signal as a
+    successful one. Counting every state as transition evidence made the two
+    indistinguishable -- and TeleportState.Failed is exactly what a host running
+    dozens of clients produces, because Roblox rate-limits matchmaking (HTTP 429).
+    main then set TELEPORTING_TO_STAGE, the supervisor treated the place lifecycle as
+    committed and returned for good, and the account stood in the lobby with a report
+    claiming the transition had been verified.
+
+    Two things must hold: a failed state must not advance teleportGeneration, and an
+    accepted StartTeleport must be re-checked, since only an actual place change ends
+    this script's session."""
+    source = (ROOT / "main.lua").read_text(encoding="utf-8")
+
+    handler = re.search(r"player\.OnTeleport:Connect\(function\((.*?)\n\s*end\)\)", source, re.S)
+    if not handler:
+        fail("the OnTeleport handler was not found", failures)
+        return
+    text = handler.group(1)
+
+    if "TeleportState.Failed" not in text:
+        fail(
+            "the OnTeleport handler does not distinguish TeleportState.Failed; a "
+            "rate-limited host would record a failed teleport as transition evidence",
+            failures,
+        )
+    if not re.search(r"teleportGeneration\s*\+=\s*1", text):
+        fail("the OnTeleport handler no longer records teleport evidence at all", failures)
+
+    if not re.search(r"^\s*stageTeleportSettleTimeout\s*=\s*\d+\s*,", (ROOT / "Config.lua").read_text(encoding="utf-8"), re.MULTILINE):
+        fail(
+            "Config.main.stageTeleportSettleTimeout is missing; an accepted "
+            "StartTeleport that never lands would go unnoticed",
+            failures,
+        )
+    if "STAGE_TELEPORT_STALLED" not in source:
+        fail(
+            "main never leaves TELEPORTING_TO_STAGE when a teleport does not land; the "
+            "supervisor would treat the place lifecycle as committed and stop watching",
+            failures,
+        )
+
+
+def check_loader_survives_throttling(failures: list[str]) -> None:
+    """`game:HttpGet` RAISES on failure, and the Loader calls it 8 times per join at
+    module scope. On a host running dozens of clients that is thousands of requests
+    an hour against one IP, which GitHub throttles -- so one transient response used
+    to kill a client for the whole session, silently, with Config.lua the worst place
+    for it because nothing at all runs afterwards."""
+    source = (ROOT / "Loader.lua").read_text(encoding="utf-8")
+
+    if "pcall(game.HttpGet" not in source:
+        fail(
+            "Loader.lua calls game:HttpGet unprotected; a single throttled response "
+            "would abort the whole client",
+            failures,
+        )
+    if not re.search(r"for attempt = 1, maximumAttempts do", source):
+        fail(
+            "Loader.lua does not retry a failed download; transient throttling must "
+            "not be terminal",
+            failures,
+        )
+    # An empty 200 behind a proxy compiles to a chunk that does nothing at all, which
+    # is indistinguishable from success unless it is rejected explicitly.
+    if "#result > 0" not in source:
+        fail(
+            "Loader.lua accepts an empty response body as a successful download",
+            failures,
+        )
+
+
+def check_every_runtime_file_traces(failures: list[str]) -> None:
+    """A captured F9 console is the only diagnostic available for a farm host, and
+    console.statusOnly silences the normal log path. Without a channel that ignores
+    that flag, "the executor never injected", "a download failed" and "a worker died"
+    all produce the same empty console -- which is exactly what happened on the
+    capture that prompted this check.
+
+    Every runtime file must be able to say it started, and the Loader must narrate
+    the stages that precede Config entirely."""
+    for name in RUNTIME_FILES:
+        source = (ROOT / name).read_text(encoding="utf-8")
+        if name == "Loader.lua":
+            # The Loader cannot use Config's tracer; it carries its own copy.
+            if "local function trace(" not in source:
+                fail(f"{name} has no trace channel of its own", failures)
+            for stage in ("attached", "ready:", "ABORT"):
+                if stage not in source:
+                    fail(f"{name} never traces the '{stage}' stage", failures)
+            continue
+        if "environment.AnimeOriginTrace" not in source:
+            fail(
+                f"{name} does not resolve the shared trace channel; a capture could "
+                f"not tell whether this file ran at all",
+                failures,
+            )
+
+    config = (ROOT / "Config.lua").read_text(encoding="utf-8")
+    if not re.search(r"^\s*diagnostics\s*=\s*true\s*,", config, re.MULTILINE):
+        fail(
+            "Config.console.diagnostics is not enabled; the trace channel exists but "
+            "emits nothing",
+            failures,
+        )
 
 
 def check_loader_arms_queue_first(failures: list[str]) -> None:
@@ -171,6 +379,12 @@ def check_loader_arms_queue_first(failures: list[str]) -> None:
 def main() -> int:
     failures: list[str] = []
     check_no_unbounded_wait(failures)
+    check_no_unbounded_wait_for_child(failures)
+    check_gate_timeout_respects_fatal_tasks(failures)
+    check_gate_budget_survives_route_restart(failures)
+    check_failed_teleport_is_not_evidence(failures)
+    check_loader_survives_throttling(failures)
+    check_every_runtime_file_traces(failures)
     check_portal_waits_for_replication(failures)
     check_bootstrap_detects_silent_death(failures)
     check_loader_arms_queue_first(failures)
