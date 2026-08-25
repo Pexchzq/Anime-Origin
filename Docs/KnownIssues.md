@@ -31,6 +31,39 @@
 
 ---
 
+## Quests: `Claimable` เป็นธงฝั่ง UI ไม่ใช่ค่าจากเซิร์ฟเวอร์ (แก้แล้ว)
+
+`ClaimAllQuests` **ไม่เคยถูกยิงเลยสักครั้ง** บนไอดีไหนก็ตาม ในรอบรันไหนก็ตาม
+state file ทั้ง 8 ไฟล์บันทึกตรงกันหมด: `attempted: false`, `claimable: 0`
+
+โครงสร้างจริงของ `PlayerData.Quests` คือ `{ Daily, Weekly, Permanent, QuestLines }`
+แต่ละ record เป็น:
+
+```json
+{"HeaderType":"Daily","Claimed":false,"StartAmount":0,"Claimable":false,"QuestIndex":12}
+```
+
+`StartAmount` คือ baseline ตอนรับเควส ความคืบหน้าจริงต้องคำนวณจาก
+`stat ปัจจุบัน − StartAmount` เทียบ goal ที่ lookup ด้วย `QuestIndex` —
+**`Claimable` ถูกเขียนโดย UI ของเควสตอน render ไม่ใช่ค่าที่เซิร์ฟเวอร์ replicate**
+โปรเจกต์นี้อ่าน PlayerData โดยไม่เปิด UI จึงเห็น `false` ตลอด: 396 จาก 396 record
+ใน discovery trace ขณะที่ `Claimed` ขยับเองได้จริง (ไอดีหนึ่งมี `claimed: 9`)
+
+เกต `if before.claimable <= 0 then return` จึงบล็อก 100% และการ verify
+`claimable < before.claimable` = `0 < 0` ก็เป็นเท็จตลอดด้วยเหตุผลเดียวกัน
+
+**ตอนนี้**: ยิงโดยไม่มีเกต (การเคลมรางวัลฟรีไม่มีงบให้เสีย เซิร์ฟเวอร์ no-op เองถ้าไม่มีอะไร
+ให้เคลม ต่างจากการสุ่มที่เสียเพชร) แล้วพิสูจน์จาก `Claimed` ซึ่งเซิร์ฟเวอร์เป็นคนเขียน
+ล็อกด้วย `Tests/check_quest_claim_gate.py`
+
+**หมายเหตุ**: `gemChange` ยังบันทึกอยู่แต่ห้ามใช้เป็นหลักฐาน — reward job ทั้ง 5 ตัว
+รันขนานกัน เพชรที่เพิ่มอาจมาจาก Daily/Playtime/Battlepass/Wheel
+
+ตัว claim อื่นไม่ได้เป็นบั๊กแบบนี้: `codes` และ `playTimeRewards` มี status รายตัวจริง
+ส่วน `battlepass`/`dailyReward`/`dailyWheel` มี `attempted: true` ทุกไฟล์
+
+---
+
 ## บั๊กที่ยืนยันแล้วและยังไม่แก้
 
 ### worker ที่ค้างใน infinite loop ยังตรวจไม่ได้ (แคบลงมากแล้ว)

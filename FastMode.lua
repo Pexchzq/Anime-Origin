@@ -767,30 +767,51 @@ local function claimAllQuests()
 		log("SKIP", "PlayerData.Quests is unavailable; ClaimAllQuests was not fired.")
 		return
 	end
-	if before.claimable <= 0 then
-		state.claimResults.quests = { attempted = false, verified = true, status = "nothing_claimable", before = before }
-		debugLog("CLAIM_QUESTS", "No authoritative Claimable=true quest exists; remote skipped.", before)
-		return
-	end
-
+	-- Deliberately NOT gated on before.claimable. `Claimable` is written by the quest
+	-- UI when it renders, not replicated by the server, and this project reads
+	-- PlayerData without ever opening UI -- so the flag was false in 396 of 396
+	-- captured records while `Claimed` moved independently. Gating on it meant this
+	-- remote was never fired once, on any account, in any run: all eight captured
+	-- bootstrap states record `attempted: false` with `claimable: 0`.
+	--
+	-- Firing unconditionally is safe here in a way it would not be for a summon. This
+	-- claims free rewards, so the server simply no-ops when nothing is due; there is
+	-- no budget to overspend. Proof therefore belongs where the rest of this file puts
+	-- it -- after the action, in PlayerData -- rather than in a precondition guess.
 	local remote = requireChild(requireChild(ReplicatedStorage, "LobbyRemotes"), "QuestRemote")
 	local beforeGems = readGems()
-	log("ACTION", string.format("Claim All Quests (%d claimable).", before.claimable))
+	log("ACTION", string.format("Claim All Quests (%d/%d already claimed).", before.claimed, before.records))
 	remote:FireServer("ClaimAllQuests")
+	-- `Claimed` is the authoritative signal: it is a server-written field, and it is
+	-- the one that actually moved in the captures. `claimable` stays in the predicate
+	-- only for a build where the flag does become meaningful.
 	local verified = verifyWithRescan(function()
-		return readQuestClaimState().claimable < before.claimable
+		local now = readQuestClaimState()
+		return now.claimed > before.claimed or now.claimable < before.claimable
 	end, Bootstrap.claimSettlementTimeout)
 	local after = readQuestClaimState()
+	-- Nothing due is a legitimate outcome, not a failure, and it has its own
+	-- fingerprint: every record was already claimed before the call.
+	local nothingDue = not verified and before.records > 0 and before.claimed >= before.records
 	state.claimResults.quests = {
 		attempted = true,
 		verified = verified,
+		nothingDue = nothingDue or nil,
 		before = before,
 		after = after,
+		-- Recorded, but never used as proof: the reward jobs run concurrently, so a
+		-- Gem delta here can belong to the Daily/Playtime/Battlepass/Wheel claim.
 		gemChange = readGems() - beforeGems,
 	}
 	saveState(state, "quests_attempted")
+	trace(verified and "quests claimed" or (nothingDue and "quests: nothing due" or "quests NOT confirmed"), {
+		claimedBefore = before.claimed,
+		claimedAfter = after.claimed,
+		records = after.records,
+	})
 	log("CLAIM", verified and "Claim All Quests verified from PlayerData."
-		or "Claim All Quests was not confirmed; no blind retry was sent.")
+		or (nothingDue and "Every quest was already claimed before the call."
+			or "Claim All Quests was not confirmed; no blind retry was sent."))
 end
 
 -- Independent reward endpoints settle concurrently. This removes the old sum of
