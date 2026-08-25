@@ -401,6 +401,73 @@ def check_lobby_return_has_a_landing_check(failures: list[str]) -> None:
         )
 
 
+def check_lobby_return_contract_matches_its_callers(failures: list[str]) -> None:
+    """Adding the settle watchdog to returnToLobby silently changed what it returns, and
+    the seven callers were not updated. The result was a function with no `return true`
+    on any path -- landing destroys the script mid-call, so arrival is unobservable from
+    inside -- while every caller still tested it as though there were one.
+
+    The five in handleActOver do `if not returnToLobby(...) then fail("END_ACTION") end`,
+    so they called fail() unconditionally: controller.active = false, every listener
+    disconnected, and the surrounding xpcall swallowing the error so the route supervisor
+    never restarted. An account that finished an act sat in the stage until morning.
+
+    Two halves are asserted, because fixing either one alone reintroduces the other bug:
+    the function must return something that CAN be true (server acceptance), and the two
+    callers that would then stop watching the account must not treat acceptance as
+    arrival.
+    """
+    source = (ROOT / "main.lua").read_text(encoding="utf-8")
+    body = re.search(r"local function returnToLobby\(reason\)(.*?)\n\treturn ([a-zA-Z]+)\nend\n",
+                     source, re.S)
+    if not body:
+        fail("returnToLobby was not found, or no longer ends in a plain return", failures)
+        return
+
+    returned = body.group(2)
+    if returned in ("false", "true", "nil"):
+        fail(
+            f"returnToLobby ends in `return {returned}`; a caller writing "
+            f"`if not returnToLobby(...) then fail(...) end` then fails on every call, "
+            f"which kills the controller and disconnects its listeners",
+            failures,
+        )
+    elif not re.search(rf"\n\tlocal {returned} = false\n", body.group(1)) \
+            or not re.search(rf"\n\t\t\t{returned} = true\n", body.group(1)):
+        fail(
+            f"returnToLobby returns `{returned}`, but nothing sets it from false to true "
+            f"on server acceptance; the caller contract is unsatisfiable again",
+            failures,
+        )
+
+    # A `return` on a truthy result means "we left" -- which this function cannot know.
+    # Both sites below would stop watching an account that is still in the stage.
+    stage = re.search(r"local ok, ([a-zA-Z]+) = pcall\(returnToLobby,(.*?)\n\t\t\tend\n",
+                      source, re.S)
+    if not stage:
+        fail("the stall watchdog's returnToLobby call was not found", failures)
+    # No trailing newline required: the captured block ends AT the `return` when that
+    # return is the last statement before the block closes, which is exactly the shape
+    # this check exists to reject. Requiring one let the mutant through.
+    elif re.search(rf"if ok and {stage.group(1)} then(?:(?!\n\t\t\tend).)*?\n\t+return(?![a-zA-Z])",
+                   stage.group(2), re.S):
+        fail(
+            "the stall watchdog stops monitoring when the server merely ACCEPTS a lobby "
+            "return; reaching that line is itself proof the client is still in the stage",
+            failures,
+        )
+
+    context = re.search(r'returnToLobby\("context never loaded"\)(.{0,200})', source, re.S)
+    if not context:
+        fail("run()'s unknown-place escape was not found", failures)
+    elif re.search(r"then\n\t{3,}.*?\n\t{3,}return\n", context.group(1), re.S):
+        fail(
+            "run() returns when the lobby teleport is merely accepted; falling through to "
+            "fail() is what earns the supervised restart that tries again",
+            failures,
+        )
+
+
 def check_unknown_place_is_escapable(failures: list[str]) -> None:
     """A place where neither the lobby portal nor any stage runtime appears is the one
     situation main cannot solve locally -- and it never tried. It failed CONTEXT,
@@ -471,6 +538,7 @@ def main() -> int:
     check_every_runtime_file_traces(failures)
     check_reward_claims_are_not_fatal(failures)
     check_lobby_return_has_a_landing_check(failures)
+    check_lobby_return_contract_matches_its_callers(failures)
     check_unknown_place_is_escapable(failures)
     check_portal_waits_for_replication(failures)
     check_bootstrap_detects_silent_death(failures)

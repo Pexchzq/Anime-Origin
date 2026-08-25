@@ -1573,10 +1573,20 @@ local function returnToLobby(reason)
 		fail("REMOTE", "RemoteEvent did not replicate before Return To Lobby.")
 	end
 	local action = recordAction("RETURN_TO_LOBBY", { reason = reason })
+	-- Returned to the caller, and the ONLY thing this function can honestly report.
+	-- "Did the client leave?" is unanswerable from in here: if it left, this function
+	-- never returns at all. Adding the settle watchdog without changing what is
+	-- returned left a function with no `return true` on any path, while all seven
+	-- callers still tested it as though there were one -- so the five in
+	-- handleActOver called fail("END_ACTION") every single time, killed the
+	-- controller and disconnected its listeners, with the surrounding xpcall
+	-- swallowing the error so the route supervisor never restarted.
+	local accepted = false
 	for attempt = 1, math.max(1, tonumber(Settings.maximumTransitionAttempts) or 2) do
 		local before = bus.teleportGeneration
 		genericRemote:FireServer("TeleportToLobby")
 		if waitUntil(function() return bus.teleportGeneration > before end, verifyTimeout) then
+			accepted = true
 			action.verified = true
 			action.attempt = attempt
 			state.lastTransition = "TELEPORT_TO_LOBBY"
@@ -1600,7 +1610,7 @@ local function returnToLobby(reason)
 			repeat
 				if not controller.active then
 					returnStep.noop("the controller was stopped while waiting for the place to change")
-					return false
+					return accepted
 				end
 				if bus.teleportFailureGeneration > failuresBefore then break end
 				task.wait(pollInterval)
@@ -1627,8 +1637,9 @@ local function returnToLobby(reason)
 		end
 	end
 	returnStep.noop("every TeleportToLobby attempt was exhausted without the place changing",
-		{ reason = reason, lastFailure = bus.lastTeleportFailure })
-	return false
+		{ reason = reason, accepted = accepted, lastFailure = bus.lastTeleportFailure })
+	-- Acceptance, not arrival. A caller must never read this as "we left".
+	return accepted
 end
 
 -- ReplayActVote/NextActVote may be toggle-like votes. Send exactly once, then
@@ -1638,8 +1649,19 @@ local function voteForTransition(remoteAction, expectedTarget)
 		tryBindRemotes()
 		return actRemote ~= nil
 	end, tonumber(Settings.runtimeLoadTimeout) or 20) then
+		diagStep("Main.vote:" .. tostring(remoteAction), {
+			expect = "ActRemoteEvent replicates so the vote can be sent",
+			deadline = 30,
+		}).fail("ActRemoteEvent never replicated, so the vote was never sent")
 		fail("REMOTE", "ActRemoteEvent did not replicate before " .. tostring(remoteAction) .. ".")
 	end
+	-- The captured screen showed Next(0/1) and Replay(0/1): zero votes cast, on an act
+	-- that had just been won. That is either "this never fired" or "it fired and the
+	-- server ignored it", and no artifact in this project could tell those apart.
+	local voteStep = diagStep("Main.vote:" .. tostring(remoteAction), {
+		expect = "the server answers with UpdateClientGame or StartWaveVote",
+		deadline = 90,
+	})
 	local action = recordAction(remoteAction, expectedTarget)
 	local beforeUpdate = bus.updateClientGeneration
 	local beforeVote = bus.startVoteGeneration
@@ -1658,6 +1680,12 @@ local function voteForTransition(remoteAction, expectedTarget)
 		saveState("server accepted " .. remoteAction)
 	end
 	saveReport(remoteAction .. (verified and " verified" or " unverified"))
+	if verified then
+		voteStep.ok({ target = serializable(expectedTarget) })
+	else
+		voteStep.noop("the vote was sent and the server replicated no transition",
+			{ target = serializable(expectedTarget) })
+	end
 	return verified
 end
 
@@ -1666,12 +1694,26 @@ local restartPending = false
 local restartAccepted = false
 
 local function handleActOver(result)
-	if handlingEnd or not controller.active then return end
+	if handlingEnd or not controller.active then
+		-- Both of these returned in total silence. An account that finished an act and
+		-- then did nothing looks identical from outside whether the handler declined to
+		-- run, ran and chose nothing, or was never called at all -- and the third case
+		-- is only distinguishable because the other two now say so.
+		trace("ActOver IGNORED", { handlingEnd = handlingEnd, controllerActive = controller.active })
+		return
+	end
 	if restartPending then
 		log("END", "ActOver arrived during an intentional Infinite restart; waiting for the new match lifecycle.", result)
 		return
 	end
 	handlingEnd = true
+	-- Closed as OK only when a transition was ACCEPTED. Whether it then landed is the
+	-- nested Main.returnToLobby / Main.vote step's verdict, and the parent edge between
+	-- them is what makes the two readable as one chain.
+	local endStep = diagStep("Main.handleActOver", {
+		expect = "a transition is chosen and the server accepts it",
+		deadline = 180,
+	})
 	local ok, errorMessage = xpcall(function()
 		local target = targetFromPayload(result) or currentTarget()
 		local success = rawget(result, "Success") == true
@@ -1688,7 +1730,16 @@ local function handleActOver(result)
 		saveState("ActOver received")
 		log("END", success and "Match ended in victory." or "Match ended in defeat.", state.lastResult)
 
+		-- The decision inputs, recorded before the branch. Which branch ran and what it
+		-- was told are the two things the screenshot could not answer.
+		endStep.note("success", success)
+		endStep.note("canReplay", canReplay)
+		endStep.note("canNext", canNext)
+		endStep.note("target", target and (tostring(target.mode) .. "/" .. tostring(target.world)
+			.. "/act" .. tostring(target.act) .. "/" .. tostring(target.difficulty)) or "unknown")
+
 		if isInfiniteTarget(target) then
+			endStep.note("branch", "infinite")
 			if canReplay and voteForTransition("ReplayActVote", target) then return end
 			if not returnToLobby("Infinite ended before the Wave restart transition") then
 				fail("END_ACTION", "Infinite ended and neither Replay nor Return Lobby was verified.")
@@ -1702,6 +1753,7 @@ local function handleActOver(result)
 
 		if isNormal and actNumber and actNumber >= tonumber(Route.firstNormalAct or 1)
 			and actNumber <= tonumber(Route.lastNormalAct or 6) then
+			endStep.note("branch", "normal-act")
 			if success and actNumber < tonumber(Route.lastNormalAct or 6)
 				and Route.useNextWhenAvailable == true and canNext then
 				local nextTarget = {
@@ -1725,10 +1777,13 @@ local function handleActOver(result)
 		end
 
 		if isHard and actNumber == tonumber(Route.levelFarmAct or 1) then
+			endStep.note("branch", "hard-level-farm")
 			-- PlayerData.Exp settled immediately after ActOver in the live capture, but
 			-- allow a short bounded window before applying the level threshold.
 			task.wait(math.max(0.5, pollInterval * 3))
 			local level, exp = readAccountLevel()
+			endStep.note("level", level)
+			endStep.note("minimumInfiniteLevel", tonumber(Route.minimumInfiniteLevel) or 15)
 			log("LEVEL", "Level-farm result evaluated.", { level = level, exp = exp })
 			if level and level >= (tonumber(Route.minimumInfiniteLevel) or 15) then
 				if not returnToLobby("account reached Infinite level gate") then
@@ -1743,6 +1798,7 @@ local function handleActOver(result)
 			return
 		end
 
+		endStep.note("branch", "unexpected-stage")
 		if not returnToLobby("unexpected stage identity; re-plan safely in lobby") then
 			fail("END_ACTION", "Unexpected stage could not return to lobby.")
 		end
@@ -1750,6 +1806,11 @@ local function handleActOver(result)
 		return debug and debug.traceback and debug.traceback(tostring(message), 2) or tostring(message)
 	end)
 	handlingEnd = false
+	if ok then
+		endStep.ok()
+	else
+		endStep.fail(errorMessage)
+	end
 	if not ok then
 		report.status = "FAILED"
 		report.error = errorMessage
@@ -1891,17 +1952,20 @@ local function runStage()
 			-- returnToLobby() calls fail() when the remote never binds, and a stalled
 			-- stage is exactly when that is most likely. Killing Main here would only
 			-- trade a silent hang for a silent death, so recover instead of failing.
-			local ok, recovered = pcall(returnToLobby,
+			local ok, accepted = pcall(returnToLobby,
 				string.format("stage stalled for %ds", math.floor(quietFor)))
-			if ok and recovered then
-				log("STALL", "Stall recovered through the verified lobby return.", {
-					recoveries = stallRecoveries,
-				})
-				return
-			end
-			log("STALL", "Stall recovery did not confirm a lobby return; re-arming the watchdog.", {
+			-- Deliberately does NOT return on acceptance. If the teleport lands, this
+			-- loop ceases to exist along with the rest of the script, so reaching the
+			-- next line is itself proof the client is still here -- and stopping the
+			-- monitor then would leave the account with nothing watching it, which is
+			-- how six accounts spent a whole captured night in a stage they had
+			-- already asked to leave.
+			log("STALL", accepted
+				and "Lobby return was accepted but the client is still here; re-arming the watchdog."
+				or "Stall recovery did not confirm a lobby return; re-arming the watchdog.", {
 				recoveries = stallRecoveries,
-				error = (not ok) and tostring(recovered) or nil,
+				accepted = ok and accepted or nil,
+				error = (not ok) and tostring(accepted) or nil,
 			})
 			-- The STALL lines above advanced `sequence` themselves; they are not progress.
 			lastProgressAt = os.clock()
@@ -1963,10 +2027,11 @@ local function run()
 		if lobbyPlaces[game.PlaceId] ~= true and Settings.recoverFromUnknownPlace ~= false then
 			trace("attempting TeleportToLobby to escape a place with no usable runtime")
 			log("CONTEXT", "Attempting Return To Lobby to recover from an unusable place.", diagnosis)
-			if returnToLobby("context never loaded") then
-				routeStep.noop("the place had no usable runtime; escaped to the lobby", diagnosis)
-				return
-			end
+			-- Same rule: acceptance is not arrival, so this never returns early. If the
+			-- teleport lands the script is gone; if it does not, falling through to
+			-- fail() is what gets the supervised restart that tries again.
+			local accepted = returnToLobby("context never loaded")
+			routeStep.note("lobbyReturnAccepted", accepted)
 		end
 		routeStep.fail("neither a lobby portal nor a stage runtime replicated", diagnosis)
 		fail("CONTEXT", "Neither lobby portal nor stage runtime loaded.")

@@ -246,6 +246,44 @@ AnimeOriginMain                AnimeOriginLifecycle
 
 ---
 
+## `returnToLobby` เปลี่ยนสัญญาแล้วไม่ได้แก้ผู้เรียก (แก้แล้ว — ผมทำพังเอง)
+
+บั๊กนี้ผมทำเองตอนคอมมิต `6c2910a` ตอนใส่ settle watchdog เข้า `returnToLobby`
+**เปลี่ยนสิ่งที่ฟังก์ชันคืนค่าโดยไม่ได้แก้ผู้เรียกทั้ง 7 จุด**
+
+หลังใส่ watchdog ฟังก์ชันนี้ **ไม่มี `return true` เหลืออยู่บนเส้นทางไหนเลย** —
+เพราะถ้าเทเลพอร์ตลงจริง สคริปถูกทำลายกลางฟังก์ชัน "ลงจอดแล้วหรือยัง" จึงเป็นคำถาม
+ที่ตอบจากในฟังก์ชันไม่ได้โดยโครงสร้าง แต่ผู้เรียกยังเช็คเหมือนมันคืน `true` ได้
+
+ที่หนักที่สุดคือ 5 จุดใน `handleActOver`:
+
+```lua
+if not returnToLobby("Hard level-farm replay unavailable") then
+    fail("END_ACTION", "Hard level-farm transition was not verified.")
+end
+```
+
+`returnToLobby` คืน `false` เสมอ → `fail()` ยิงทุกครั้ง → `xpcall` ใน `handleActOver`
+จับไว้เอง → `controller.active = false` + `disconnectAll()` →
+**ไอดีค้างในด่านถาวร ไม่มี route restart** เพราะ error ไม่เคยไปถึง supervisor
+
+ยังกระทบอีก 2 จุด — stall watchdog ใน `runStage` และทางหนีออกจาก place ที่ใช้ไม่ได้
+ใน `run()` (ตัวหลังคือของที่เพิ่งใส่ใน `6c2910a` เอง **ซึ่งไม่มีทางทำงานได้เลย**)
+
+**ตอนนี้**: `returnToLobby` คืนค่า `accepted` = เซิร์ฟเวอร์ตอบรับหรือไม่
+ซึ่งเป็นสิ่งเดียวที่มันรู้ได้จริง ส่วน "ลงจอดแล้วหรือยัง" พิสูจน์ได้ทางเดียวคือ
+สคริปหายไป และอีกสองจุดถูกแก้ให้**ไม่ถือว่าการตอบรับ = การไปถึง** ล็อกด้วย
+`check_lag_resilience.py::check_lobby_return_contract_matches_its_callers`
+(mutation-test แล้ว 5 ตัว จับได้หมด)
+
+**หลักฐาน**: ภาพจอ 25 ส.ค. — Hard Act 1 ชนะ, `Next(0/1)` `Replay(0/1)` ศูนย์โหวต,
+ไอดียืนนิ่งในด่าน อาการ**สอดคล้อง**กับบั๊กนี้ แต่**ยังพิสูจน์ไม่ได้ว่าเป็นสาเหตุ**
+เพราะไม่มีล็อกบอกว่า `handleActOver` เข้าสาขาไหน หรือถูกเรียกหรือเปล่า —
+รอบนี้ใส่ step `Main.handleActOver` (จด `success`/`canReplay`/`canNext`/`level`/สาขา),
+`Main.vote:<action>` และบรรทัด `ActOver IGNORED` ไว้แล้ว capture หน้าตอบได้แน่นอน
+
+---
+
 ## ยังไม่ได้พิสูจน์ (รอ capture รอบหน้า)
 
 รายการนี้แยกจากทุกหัวข้อข้างบนโดยตั้งใจ ข้างบนคือสิ่งที่ตรวจกับซอร์สหรือกับ log จริงแล้ว
