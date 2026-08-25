@@ -79,6 +79,10 @@ local Config = {
 			-- evidence before FastMode advances to its next phase.
 			statePollInterval = 0.1,
 			claimSettlementTimeout = 4,
+			-- Floor for the CONCURRENT reward phase as a whole. The computed budget
+			-- already scales with the longest job; this only stops a shrunken
+			-- per-verification timeout from collapsing the outer window with it.
+			claimBudgetTimeout = 45,
 			-- Auto-Execute begins before the lobby's live tables on slower joins.
 			-- Refresh getgc during this window instead of failing on the first scan.
 			runtimeLoadTimeout = 60,
@@ -208,6 +212,13 @@ local Config = {
 		-- TELEPORTING_TO_STAGE, the supervisor returned for good, and the account
 		-- stood in the lobby with a controller that had already stopped watching.
 		stageTeleportSettleTimeout = 20,
+		-- A place where neither the lobby portal nor any stage runtime ever appears is
+		-- the one situation main cannot solve locally. Six captured accounts finished
+		-- Act 6, had TeleportToLobby accepted, never actually left the stage place, and
+		-- then sat there all night: main failed CONTEXT four times and stopped, AutoPlay
+		-- restarted five times and stopped. Ask the server for a lobby teleport instead
+		-- of dying in place. Set false to keep the old behaviour.
+		recoverFromUnknownPlace = true,
 		-- DISPROVEN, kept off. The theory was that MapSelectRemote "StartSelection"
 		-- would be accepted without walking into a Pod, since main.lua fires that remote
 		-- either way. It was tried and the server refused it 26 times out of 26, with no

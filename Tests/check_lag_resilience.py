@@ -346,6 +346,90 @@ def check_every_runtime_file_traces(failures: list[str]) -> None:
         )
 
 
+def check_reward_claims_are_not_fatal(failures: list[str]) -> None:
+    """The concurrent reward phase used to get `claimSettlementTimeout + 5` = 9s for
+    five jobs, and raised when they overran. But each job is a SEQUENCE of verified
+    round-trips -- claimPlayTimeRewards alone walks every configured index and waits
+    the full settlement timeout on each unavailable one, six at four seconds -- so the
+    budget was structurally below the work.
+
+    Six accounts died on it in one captured night, and the logs prove the jobs were
+    still succeeding: "Daily Wheel verified" was written AFTER the FATAL line. Because
+    main treats FastMode as a fatal bootstrap task, each one cost the account its whole
+    route. Free-reward claims must never be fatal, and the budget must scale with the
+    longest job rather than with one verification."""
+    source = (ROOT / "FastMode.lua").read_text(encoding="utf-8")
+    body = re.search(r"local function claimConfiguredRewards\(\)(.*?)\nend\n", source, re.S)
+    if not body:
+        fail("claimConfiguredRewards was not found", failures)
+        return
+    text = body.group(1)
+
+    for match in re.finditer(r'fail\("CLAIMS"', text):
+        fail(
+            "claimConfiguredRewards still raises on a claim timeout or a claim "
+            "failure; main treats FastMode as fatal, so a slow free-reward claim "
+            "would again cost the account its entire route",
+            failures,
+        )
+        break
+
+    if "playTimeRewardIndices" not in text:
+        fail(
+            "the claim budget does not scale with the longest job; a per-verification "
+            "timeout cannot bound a job that performs many verifications in sequence",
+            failures,
+        )
+
+
+def check_lobby_return_has_a_landing_check(failures: list[str]) -> None:
+    """returnToLobby was left without the settle watchdog on the argument that a stage
+    has its own stall recovery. Six accounts disproved it in one night: they finished
+    Act 6, fired TeleportToLobby, had it accepted, persisted "server accepted Return To
+    Lobby" -- and were still in the stage place afterwards with every controller
+    stopped. Server acceptance is not arrival, in either direction."""
+    source = (ROOT / "main.lua").read_text(encoding="utf-8")
+    body = re.search(r"local function returnToLobby\(reason\)(.*?)\nend\n", source, re.S)
+    if not body:
+        fail("returnToLobby was not found", failures)
+        return
+    if "LOBBY_RETURN_STALLED" not in body.group(1):
+        fail(
+            "returnToLobby treats an accepted TeleportToLobby as arrival; a teleport "
+            "that never lands would leave the account in the stage with nothing watching",
+            failures,
+        )
+
+
+def check_unknown_place_is_escapable(failures: list[str]) -> None:
+    """A place where neither the lobby portal nor any stage runtime appears is the one
+    situation main cannot solve locally -- and it never tried. It failed CONTEXT,
+    exhausted its restarts and stopped, while AutoPlay did the same, leaving six
+    captured accounts idle for the rest of the night. It must ask the server for a
+    lobby teleport, and it must say WHERE the portal path broke so the next capture
+    can distinguish a slow lobby from an unrecognised place."""
+    source = (ROOT / "main.lua").read_text(encoding="utf-8")
+    run = re.search(r"local function run\(\)(.*?)\nend\n", source, re.S)
+    if not run:
+        fail("main's run() was not found", failures)
+        return
+    text = run.group(1)
+
+    if "returnToLobby(" not in text:
+        fail(
+            "main gives up on an unusable place instead of trying to leave it; the "
+            "account stays there with every controller stopped",
+            failures,
+        )
+    if "portalPath" not in text:
+        fail(
+            "the CONTEXT failure does not report where the portal path broke; a slow "
+            "lobby, a stage whose match never started and an unrecognised place all "
+            "look identical in the log",
+            failures,
+        )
+
+
 def check_loader_arms_queue_first(failures: list[str]) -> None:
     """queue_on_teleport is the only thing that brings the script back after a place
     transition. Anything that yields before it is armed is a window where a teleport
@@ -385,6 +469,9 @@ def main() -> int:
     check_failed_teleport_is_not_evidence(failures)
     check_loader_survives_throttling(failures)
     check_every_runtime_file_traces(failures)
+    check_reward_claims_are_not_fatal(failures)
+    check_lobby_return_has_a_landing_check(failures)
+    check_unknown_place_is_escapable(failures)
     check_portal_waits_for_replication(failures)
     check_bootstrap_detects_silent_death(failures)
     check_loader_arms_queue_first(failures)

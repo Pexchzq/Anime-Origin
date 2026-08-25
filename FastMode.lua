@@ -860,12 +860,48 @@ local function claimConfiguredRewards()
 		end)
 	end
 
-	local timeout = (tonumber(Bootstrap.claimSettlementTimeout) or 4) + 5
-	if not waitUntil(function() return remaining == 0 end, timeout) then
-		fail("CLAIMS", "Concurrent reward jobs exceeded their bounded settlement window.")
+	-- Each job is a SEQUENCE of verified round-trips, not one call, so the budget has
+	-- to cover the slowest job end to end. claimPlayTimeRewards walks every configured
+	-- index and waits the full settlement timeout on each one that turns out to be
+	-- unavailable -- six indices at four seconds is 24s on its own, already far past
+	-- the old `claimSettlementTimeout + 5` = 9s. Six accounts died on that budget in
+	-- one captured night.
+	local perVerification = math.max(1, tonumber(Bootstrap.claimSettlementTimeout) or 4)
+	local longestJobSteps = math.max(1, #(Settings.playTimeRewardIndices or {}))
+	-- +2 steps of headroom: verifyWithRescan falls back to a full getgc walk when
+	-- evidence has not moved, and that walk is slowest exactly when the host is loaded.
+	local timeout = math.max(
+		tonumber(Bootstrap.claimBudgetTimeout) or 0,
+		perVerification * (longestJobSteps + 2)
+	)
+	local settled = waitUntil(function() return remaining == 0 end, timeout)
+
+	-- NOT fatal, in either branch below. These are best-effort claims of free rewards:
+	-- nothing about the account becomes inconsistent when one is slow or refused, and
+	-- the summon phase re-reads Gems and verifies every batch against PlayerData
+	-- regardless. Raising here made FastMode FAILED, which main treats as a fatal
+	-- bootstrap task, which killed the route -- and the captured logs show the jobs
+	-- were still succeeding as it happened: "Daily Wheel verified" was written AFTER
+	-- the FATAL line. A slow reward claim must never cost an account its whole night.
+	if not settled then
+		state.claimBudgetExceeded = {
+			timeout = timeout,
+			remaining = remaining,
+			at = os.time(),
+		}
+		log("CLAIMS", "Reward jobs were still settling past their window; continuing without them.", {
+			timeout = timeout,
+			stillRunning = remaining,
+		})
+		trace("claim budget exceeded; continuing", { timeout = timeout, stillRunning = remaining })
 	end
 	for name, message in next, failures do
-		fail("CLAIMS", name .. " failed: " .. tostring(message))
+		state.claimFailures = state.claimFailures or {}
+		state.claimFailures[name] = tostring(message)
+		log("CLAIMS", name .. " failed; the remaining bootstrap continues.", { error = tostring(message) })
+	end
+	if not settled or next(failures) ~= nil then
+		saveState(state, "claims_degraded_but_nonfatal")
 	end
 end
 

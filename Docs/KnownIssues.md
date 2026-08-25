@@ -64,6 +64,61 @@ state file ทั้ง 8 ไฟล์บันทึกตรงกันหม
 
 ---
 
+## ค้างหน้าล็อบบี้: วัดจากรอบรันจริง 40 ไอดี (แก้แล้ว)
+
+capture รอบ 24 ส.ค. — **12 จาก 40 ไอดีตาย (30%)** ที่เหลือ 28 ไอดี `MONITORING_STAGE` ปกติ
+แยกได้เป็น 2 สาเหตุที่ไม่เกี่ยวกันเลย:
+
+### 6 ไอดีตายในล็อบบี้ — งบเคลมรางวัลแคบเกินไปและเป็น fatal
+
+`claimConfiguredRewards` ให้ `claimSettlementTimeout + 5` = **9 วินาที** กับงาน 5 ตัวที่รันขนานกัน
+แต่แต่ละงานเป็น *ลำดับ* ของการยืนยัน ไม่ใช่การเรียกครั้งเดียว — `claimPlayTimeRewards`
+เดินครบทุก index ที่ตั้งไว้และรอเต็ม timeout ทุกอันที่ไม่มีของ = 6 × 4 = **24 วินาที**
+เกินงบไปตั้งแต่ต้น
+
+ล็อกพิสูจน์ว่างานยังทำสำเร็จอยู่ตอนที่มันถูกฆ่า:
+
+```text
+[040][ERROR] CLAIMS: Concurrent reward jobs exceeded their bounded settlement window.
+[041][FATAL] Execution stopped
+[042][STATE] Persisted bootstrap state: daily_wheel_attempted   ← หลัง FATAL
+[043][CLAIM] Daily Wheel verified.                              ← หลัง FATAL
+```
+
+main ถือว่า FastMode เป็น fatal task → route ตาย → ยืนนิ่งในล็อบบี้
+
+**ตอนนี้**: งบคำนวณจากงานที่ยาวที่สุด (`perVerification × (จำนวน index + 2)` มีพื้น
+`claimBudgetTimeout`) และ timeout/failure **ไม่ fatal อีกต่อไป** — บันทึกเป็น warning
+แล้วไปต่อ การเคลมรางวัลฟรีไม่ทำให้ state ของบัญชีเพี้ยน และ summon phase อ่าน Gems
+ใหม่พร้อมยืนยันทุก batch อยู่แล้ว
+
+### 6 ไอดีตายในด่าน — `TeleportToLobby` ได้รับการยืนยันแต่ไม่เคยลงจอด
+
+ทั้ง 6 จบ Act 6 Normal สำเร็จ (15 เวฟ) → main ยิง `TeleportToLobby` → เซิร์ฟเวอร์รับ →
+`lastReason: "server accepted Return To Lobby"` ถูกบันทึกลงดิสก์ → **แต่ client ไม่เคยออกจาก
+place นั้น**
+
+รอบก่อนผมใส่ settle watchdog เฉพาะ `completeTeleport` (ล็อบบี้→ด่าน) แล้ว**จงใจข้าม**
+`returnToLobby` ด้วยเหตุผลว่าฝั่งด่านมี `stageStallTimeout` คุมอยู่แล้ว — **เหตุผลนั้นผิด**
+และ capture นี้พิสูจน์แล้ว
+
+พอค้างอยู่ตรงนั้น ไม่มีอะไรพยายามพาออกมาเลย:
+
+```text
+main     : CONTEXT fail × 4 → FATAL
+AutoPlay : MatchRuntime not found × 5 restart → หยุดถาวร
+```
+
+**ตอนนี้**: `returnToLobby` มี settle watchdog แบบเดียวกับ `completeTeleport` และเมื่อ
+CONTEXT ล้มใน place ที่ไม่ใช่ล็อบบี้ main จะยิง `TeleportToLobby` เพื่อหนีออกก่อน
+แทนที่จะตายคาที่ (`Config.main.recoverFromUnknownPlace`)
+
+พร้อมกันนั้น CONTEXT failure จะรายงานว่า **path พังตรงไหน** (`MainFolder=ok > Lobby=ok >
+MapSelectors=MISSING`) เพราะเดิมล็อกบอกได้แค่ "neither loaded" ซึ่งจริงทั้งกับล็อบบี้ที่
+replicate ช้า, ด่านที่แมตช์ไม่เริ่ม และ place ที่โปรเจกต์ไม่รู้จัก — สามปัญหาคนละเรื่องกัน
+
+---
+
 ## บั๊กที่ยืนยันแล้วและยังไม่แก้
 
 ### worker ที่ค้างใน infinite loop ยังตรวจไม่ได้ (แคบลงมากแล้ว)

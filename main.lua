@@ -63,6 +63,14 @@ local consoleStatusOnly = typeof(Config.console) == "table"
 
 local Route = Settings.fastGemsRoute
 local Entrance = Settings.lobbyEntrance
+
+-- main routes from live runtime evidence, not from a place id, and that stays true.
+-- These tables are used only to DESCRIBE where a failure happened: "the portal never
+-- replicated in the known lobby" and "this place is in neither list" are different
+-- problems, and a log that cannot tell them apart sent one night's diagnosis in a
+-- circle. They also gate the escape below, which must never fire in the lobby.
+local lobbyPlaces = (typeof(Config.runtimePlaces) == "table" and Config.runtimePlaces.lobby) or {}
+local stagePlaces = (typeof(Config.runtimePlaces) == "table" and Config.runtimePlaces.stage) or {}
 assert(typeof(Route) == "table", "Config.main.fastGemsRoute is missing.")
 assert(typeof(Entrance) == "table", "Config.main.lobbyEntrance is missing.")
 
@@ -1486,9 +1494,41 @@ local function returnToLobby(reason)
 			saveState("server accepted Return To Lobby")
 			report.status = "TELEPORTING_TO_LOBBY"
 			saveReport("return lobby verified")
-			return true
+
+			-- Same watchdog as the stage teleport, and for the same reason. This was
+			-- left out on the argument that a stage already has stall recovery -- the
+			-- captured night disproved it: six accounts finished Act 6, fired
+			-- TeleportToLobby, had it accepted, and were still standing in the stage
+			-- place afterwards with `lastReason: server accepted Return To Lobby`
+			-- persisted and nothing left watching them.
+			--
+			-- A real place transition tears this script down, so reaching the code
+			-- below is itself proof the teleport never landed.
+			local settleTimeout = math.max(1, tonumber(Settings.stageTeleportSettleTimeout) or 20)
+			local settleDeadline = os.clock() + settleTimeout
+			local failuresBefore = bus.teleportFailureGeneration
+			repeat
+				if not controller.active then return false end
+				if bus.teleportFailureGeneration > failuresBefore then break end
+				task.wait(pollInterval)
+			until os.clock() >= settleDeadline
+
+			action.verified = false
+			action.landed = false
+			report.status = "LOBBY_RETURN_STALLED"
+			trace("return to lobby DID NOT LAND", { attempt = attempt, reason = reason })
+			log("TELEPORT", "Accepted TeleportToLobby did not land; retrying.", {
+				attempt = attempt,
+				reason = reason,
+				lastFailure = bus.lastTeleportFailure,
+			}, true)
+			saveReport("return to lobby did not land", true)
+		else
+			-- Kept distinct from the line above on purpose: "the server never answered"
+			-- and "the server answered and the client still did not move" call for
+			-- different investigations, and one shared message hid that for a night.
+			log("VERIFY", "TeleportToLobby was not confirmed on this attempt.", { attempt = attempt })
 		end
-		log("VERIFY", "TeleportToLobby was not confirmed on this attempt.", { attempt = attempt })
 		if attempt < (tonumber(Settings.maximumTransitionAttempts) or 2) then
 			task.wait(tonumber(Settings.transitionRetryDelay) or 1)
 		end
@@ -1787,7 +1827,43 @@ local function run()
 			or Workspace:FindFirstChild("Towers") ~= nil
 	end, tonumber(Settings.runtimeLoadTimeout) or 20)
 	if not contextReady then
-		trace("CONTEXT FAILED: neither lobby portal nor stage runtime replicated")
+		-- Report WHERE the portal path breaks, not just that it did. Six accounts spent
+		-- a night here and the log could only say "neither loaded", which is true of a
+		-- lobby whose MapSelectors have not replicated, of a stage whose match never
+		-- started, and of a place this project does not recognise at all -- three very
+		-- different problems that needed three different answers.
+		local walked, node = {}, Workspace
+		for _, segment in ipairs(Entrance.portalRootPath or {}) do
+			node = node and node:FindFirstChild(tostring(segment)) or nil
+			table.insert(walked, tostring(segment) .. (node and "=ok" or "=MISSING"))
+			if not node then break end
+		end
+		local diagnosis = {
+			placeId = game.PlaceId,
+			knownLobby = lobbyPlaces[game.PlaceId] == true,
+			knownStage = stagePlaces[game.PlaceId] == true,
+			portalPath = table.concat(walked, " > "),
+			towers = Workspace:FindFirstChild("Towers") ~= nil,
+			matchRuntime = resolveMatchRuntime() ~= nil,
+			genericRemote = genericRemote ~= nil,
+		}
+		trace("CONTEXT FAILED: neither lobby portal nor stage runtime replicated", diagnosis)
+		log("CONTEXT", "Neither lobby portal nor stage runtime loaded.", diagnosis, true)
+
+		-- Then try to leave. Standing in a place whose runtime never appears is the one
+		-- situation where this controller has nothing left to do locally, and the six
+		-- captured accounts prove it never resolves on its own: main failed CONTEXT four
+		-- times and stopped, AutoPlay restarted five times and stopped, and the client
+		-- sat there for the rest of the night. TeleportToLobby is a bounded, verified
+		-- transition that puts the account somewhere the route understands.
+		--
+		-- Never from the lobby itself -- there it would be a loop, and a lobby whose
+		-- portal is merely slow is served by the supervised restart instead.
+		if lobbyPlaces[game.PlaceId] ~= true and Settings.recoverFromUnknownPlace ~= false then
+			trace("attempting TeleportToLobby to escape a place with no usable runtime")
+			log("CONTEXT", "Attempting Return To Lobby to recover from an unusable place.", diagnosis)
+			if returnToLobby("context never loaded") then return end
+		end
 		fail("CONTEXT", "Neither lobby portal nor stage runtime loaded.")
 	end
 
