@@ -36,6 +36,45 @@ local Config = {
 		},
 	},
 
+	-- Runtime diagnostics recorder (Diag.lua).
+	--
+	-- Named debugRecorder rather than `diagnostics` on purpose: `console.diagnostics`
+	-- already exists and means something else entirely (whether the [AO] channel prints
+	-- to F9). Two settings a letter apart controlling unrelated subsystems is how a
+	-- later edit silently disables the wrong one.
+	--
+	-- `folder` is deliberately NOT fastGems.stateFolder. Everything the recorder writes
+	-- is derived from one run and safe to delete at any moment; AnimeOrigin/ holds
+	-- FastModeBootstrap_*.json and MainRoute_*.json, which an interrupted account needs
+	-- in order to finish its bootstrap. Keeping them in one folder means the safe
+	-- cleanup and the destructive one look identical.
+	debugRecorder = {
+		enabled = true,
+		folder = "AnimeOriginDiag",
+
+		-- 54 clients x this cap is the entire size of a capture. 64 KB each keeps a
+		-- full-fleet zip in the low single-digit megabytes, which is the difference
+		-- between a capture that can be sent for analysis and one that cannot.
+		eventByteCap = 65536,
+
+		-- The digest is rewritten on a timer because a stuck client never reaches a
+		-- natural flush point, and that client is precisely the one worth reading.
+		digestInterval = 10,
+		reapInterval = 5,
+
+		-- How long a step may stay open before it is called STUCK. Deliberately longer
+		-- than any single bounded wait in the project (the longest is the 300s bootstrap
+		-- gate, which passes its own deadline), so a merely slow host does not produce a
+		-- capture full of false stalls.
+		defaultStepDeadline = 90,
+
+		tailEvents = 40,
+		maximumOpenSteps = 192,
+		maximumNodes = 512,
+		chainDepth = 12,
+		reasonClip = 180,
+	},
+
 	-- Read-only realtime account/stage observer. It uses the same non-UI runtime
 	-- tables and server events as the controllers and never sends a remote.
 	logStats = {

@@ -37,6 +37,13 @@ local function trace(message, data)
 	end
 	print(string.format("[AO][%03d][%6.1fs][LOADER] %s%s",
 		environment.AnimeOriginTraceSequence, os.clock() - traceEpoch, tostring(message), suffix))
+	-- Also record into the diagnostics capture once it exists. Resolved per call
+	-- rather than captured, because the lines above run before Diag.lua is downloaded
+	-- and those belong to the console half of the capture only.
+	local diag = environment.AnimeOriginDiag
+	if typeof(diag) == "table" and typeof(diag.mark) == "function" then
+		diag.mark("Loader", message, data)
+	end
 end
 
 trace("attached", {
@@ -191,6 +198,29 @@ if not configOk then
 end
 trace("Config.lua executed")
 
+-- The diagnostics recorder loads next so it can observe the seven workers below.
+-- Its download is deliberately NON-FATAL, unlike every other file here: a recorder
+-- that can abort the loader would be a new way for the farm to die, and the whole
+-- reason it exists is that the farm keeps dying in ways nothing records. A client
+-- that fails this download still farms normally; it just produces a console capture
+-- instead of a folder capture, and the line below says which happened.
+do
+	local source = downloadSource("Diag.lua")
+	local chunk = source and loadstring(source, "AnimeOrigin.Diag.lua") or nil
+	local ok = false
+	if chunk then
+		ok = pcall(chunk)
+	end
+	if ok and typeof(environment.AnimeOriginDiag) == "table" then
+		trace("Diag.lua ready", { folder = environment.AnimeOriginDiag.folder })
+	else
+		trace("Diag.lua UNAVAILABLE; continuing without folder diagnostics", {
+			downloaded = source ~= nil,
+			compiled = chunk ~= nil,
+		})
+	end
+end
+
 -- A worker publishes RUNNING early, then runs hundreds of lines of module-scope
 -- initialisation before its own xpcall exists. A raw error in that window --
 -- a failed assert, an index into a folder that has not replicated -- unwinds past
@@ -210,32 +240,63 @@ local function publishWorkerFailure(fileName, runtimeError)
 	local entry = lifecycle.tasks[taskName]
 	local status = typeof(entry) == "table" and tostring(entry.status) or nil
 	if status == "COMPLETE" or status == "SKIPPED" or status == "FAILED" then return end
+	local details = {
+		phase = "loader",
+		error = tostring(runtimeError),
+		reason = "the worker raised before it could publish a terminal signal",
+	}
 	lifecycle.tasks[taskName] = {
 		status = "FAILED",
 		updatedAt = os.time(),
 		userId = entry and entry.userId or (game:GetService("Players").LocalPlayer
 			and game:GetService("Players").LocalPlayer.UserId or nil),
-		details = {
-			phase = "loader",
-			error = tostring(runtimeError),
-			reason = "the worker raised before it could publish a terminal signal",
-		},
+		details = details,
 	}
+	-- Record the same thing as a signal edge. This is the head of the most damaging
+	-- chain the project has: a worker dies here, main's gate waits out a task that
+	-- will never report, and the account stands in the lobby until the host restarts.
+	local diag = environment.AnimeOriginDiag
+	if typeof(diag) == "table" and typeof(diag.signal) == "function" then
+		diag.signal("lifecycle." .. taskName, "FAILED", details, "Loader")
+	end
 end
 
 -- Downloads stay sequential so one throttled response cannot be mistaken for eight,
 -- but each worker RUNS in its own task: a long AutoPlay loop must not delay the
 -- download of Optimizer and logstats behind it.
+local function diagStep(name, opts)
+	local diag = environment.AnimeOriginDiag
+	if typeof(diag) == "table" and typeof(diag.step) == "function" then
+		return diag.step(name, opts)
+	end
+	return { ok = function() end, noop = function() end, fail = function() end }
+end
+
 for index, fileName in ipairs(workerFiles) do
+	-- The download and the worker's own module-scope initialisation are separate
+	-- steps because they fail for unrelated reasons and one capture must tell them
+	-- apart: a failed download is a throttled host, a failed init is a bug in the file.
+	local downloadStep = diagStep("Loader.download:" .. fileName, {
+		expect = "the file compiles into a chunk",
+		deadline = 60,
+	})
 	local chunk = downloadChunk(fileName, index + 1, totalFiles)
+	downloadStep.ok()
+
 	task.spawn(function()
+		local initStep = diagStep("Loader.init:" .. fileName, {
+			expect = "the worker reaches its own main loop without raising",
+			deadline = 120,
+		})
 		local ok, runtimeError = pcall(chunk)
 		if not ok then
+			initStep.fail(runtimeError)
 			pcall(publishWorkerFailure, fileName, runtimeError)
 			trace(string.format("worker %s RAISED", fileName), { error = tostring(runtimeError) })
 			error(string.format("[AnimeOriginLoader] Runtime failed at worker %d/%d %s: %s",
 				index, #workerFiles, fileName, tostring(runtimeError)), 0)
 		end
+		initStep.ok()
 	end)
 end
 

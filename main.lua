@@ -28,6 +28,39 @@ local environment = getgenv()
 local function trace(message, data)
 	local tracer = environment.AnimeOriginTrace
 	if typeof(tracer) == "function" then tracer("Main", message, data) end
+	-- The same milestone, in structured form, into the folder capture. Feeding
+	-- the recorder from the existing trace points means the whole milestone
+	-- stream is captured without a second set of call sites to keep in sync.
+	local diag = environment.AnimeOriginDiag
+	if typeof(diag) == "table" and typeof(diag.mark) == "function" then
+		diag.mark("Main", message, data)
+	end
+end
+
+-- Diagnostics accessors. Resolved per call and always returning something callable,
+-- so instrumentation can never become the reason a controller stops: a client whose
+-- Diag.lua download failed runs exactly as before, minus the folder capture.
+local INERT_STEP = {}
+function INERT_STEP.ok() return INERT_STEP end
+function INERT_STEP.noop() return INERT_STEP end
+function INERT_STEP.fail() return INERT_STEP end
+function INERT_STEP.note() return INERT_STEP end
+function INERT_STEP.because() return INERT_STEP end
+function INERT_STEP.extend() return INERT_STEP end
+
+local function diagStep(name, opts)
+	local diag = environment.AnimeOriginDiag
+	if typeof(diag) ~= "table" or typeof(diag.step) ~= "function" then return INERT_STEP end
+	opts = opts or {}
+	-- Anchor here rather than inside Diag: one level up from this helper is the real
+	-- call site, which is the line a capture has to name when it says where the bug is.
+	if opts.where == nil and typeof(debug) == "table" and typeof(debug.info) == "function" then
+		local ok, source, line = pcall(debug.info, 2, "sl")
+		if ok and source then
+			opts.where = (tostring(source):match("([^/\\]+)$") or tostring(source)) .. ":" .. tostring(line)
+		end
+	end
+	return diag.step(name, opts)
 end
 
 -- Auto-Execute order is intentionally treated as nondeterministic. main.lua may
@@ -271,8 +304,30 @@ local function waitForBootstrapWorkers()
 	local lastSnapshot
 	report.status = "WAITING_FOR_BOOTSTRAP"
 
+	-- Declared up front so a capture judges this gate on its OUTCOME rather than on
+	-- whether the loop returned. The two are not the same thing here: the gate returns
+	-- true on a non-fatal timeout, which is correct routing behaviour and simultaneously
+	-- a worker that never finished. NO_OP is that case. STUCK -- deadline set past the
+	-- gate's own timeout -- would mean the loop itself never returned, which is a bug
+	-- in this function and nowhere else.
+	local gateStep = diagStep("Main.bootstrapGate", {
+		expect = "every required worker reaches COMPLETE / SKIPPED / FAILED",
+		deadline = (tonumber(gate.timeout) or 300) + 15,
+	})
+	-- Attributed at the CLOSE, never at the open: because() binds to the signal as it
+	-- stands when it is called, and the entry worth pointing a chain at is the terminal
+	-- one, not the RUNNING that every worker publishes in its first moments.
+	local function attributeGate()
+		for _, taskName in ipairs(required) do
+			gateStep.because("lifecycle." .. taskName)
+		end
+	end
+
 	repeat
-		if not controller.active then return false end
+		if not controller.active then
+			gateStep.noop("the controller was stopped while the gate was waiting")
+			return false
+		end
 		local lifecycle = environment.AnimeOriginLifecycle
 		local tasks = typeof(lifecycle) == "table" and lifecycle.jobId == game.JobId
 			and lifecycle.tasks or nil
@@ -301,6 +356,8 @@ local function waitForBootstrapWorkers()
 			snapshot[taskName] = silent and (status .. " (no signal)") or status
 			if status == "FAILED" and fatalTasks[taskName] == true then
 				report.bootstrapGate = snapshot
+				attributeGate()
+				gateStep.fail(taskName .. " reported FAILED and is fatal", snapshot)
 				fail("BOOTSTRAP", taskName .. " failed; main routing was not started."
 					.. (silent and (" It " .. silent .. ".") or ""))
 			elseif status == "FAILED" then
@@ -322,7 +379,11 @@ local function waitForBootstrapWorkers()
 			-- "the account just stands there" into a named worker and a named status.
 			trace(allComplete and "bootstrap gate open" or "bootstrap gate waiting", snapshot)
 		end
-		if allComplete then return true end
+		if allComplete then
+			attributeGate()
+			gateStep.ok(snapshot)
+			return true
+		end
 		lastSnapshot = snapshot
 		task.wait(pollInterval)
 	until os.clock() >= deadline
@@ -343,7 +404,9 @@ local function waitForBootstrapWorkers()
 		end
 	end
 	report.bootstrapGate = stalled
+	attributeGate()
 	if #blocking > 0 then
+		gateStep.fail("timed out with a fatal worker non-terminal: " .. table.concat(blocking, ", "), stalled)
 		fail("BOOTSTRAP", string.format(
 			"Timed out after %ss with a fatal worker still non-terminal (%s); main routing was not started.",
 			tostring(tonumber(gate.timeout) or 300), table.concat(blocking, ", ")))
@@ -352,6 +415,10 @@ local function waitForBootstrapWorkers()
 	report.bootstrapWarnings.timeout = string.format(
 		"Gate timed out after %ss; only non-fatal workers were still running, so routing continued.",
 		tostring(tonumber(gate.timeout) or 300))
+	-- Routing continues, and that is deliberate -- but a worker that never reached a
+	-- terminal status did not do its job, and a capture must not call this healthy just
+	-- because the route survived it.
+	gateStep.noop("timed out; only non-fatal workers were still non-terminal", stalled)
 	trace("bootstrap gate TIMED OUT on non-fatal workers only; routing continues", stalled)
 	log("BOOTSTRAP", "Bootstrap gate timed out on non-fatal workers only; continuing to route selection.", stalled)
 	return true
@@ -1227,6 +1294,14 @@ local function startSelectedStage(target)
 
 	-- Selection is accepted; ask for the teleport and require TeleportGui as proof.
 	local function completeTeleport(via, attempt)
+		-- There is no OK path here by construction: a teleport that lands tears this
+		-- script down mid-function, so reaching ANY close below is already proof the
+		-- client never left. That asymmetry is the point -- every recorded outcome of
+		-- this step is a failure to leave, and the reason distinguishes them.
+		local teleportStep = diagStep("Main.completeTeleport", {
+			expect = "the client leaves this place; reaching the end of this function proves it did not",
+			deadline = 150,
+		})
 		trace("StartSelection accepted by the server", { via = via, attempt = attempt })
 		action.selectionVerified = true
 		action.selectionVia = via
@@ -1245,6 +1320,7 @@ local function startSelectedStage(target)
 		if not teleported then
 			log("VERIFY", "StartTeleport was not confirmed; no blind success recorded.",
 				{ attempt = attempt, via = via })
+			teleportStep.fail("the server never confirmed StartTeleport", { via = via, attempt = attempt })
 			return false
 		end
 		state.lastTransition = "START_TELEPORT"
@@ -1265,7 +1341,10 @@ local function startSelectedStage(target)
 		local settleDeadline = os.clock() + settleTimeout
 		local failuresBefore = bus.teleportFailureGeneration
 		repeat
-			if not controller.active then return false end
+			if not controller.active then
+				teleportStep.noop("the controller was stopped while waiting for the place to change")
+				return false
+			end
 			if bus.teleportFailureGeneration > failuresBefore then break end
 			task.wait(pollInterval)
 		until os.clock() >= settleDeadline
@@ -1291,6 +1370,7 @@ local function startSelectedStage(target)
 		-- teleported. Coalescing it behind reportFlushInterval risks losing it if the
 		-- next attempt does land and tears the script down.
 		saveReport("stage teleport did not land", true)
+		teleportStep.noop(reason, { via = via, attempt = attempt, lastFailure = bus.lastTeleportFailure })
 		return false
 	end
 
@@ -1476,10 +1556,20 @@ local function currentTarget()
 end
 
 local function returnToLobby(reason)
+	-- Same asymmetry as completeTeleport: a landed return destroys this script, so
+	-- every close recorded here is a failure to leave. Six accounts spent a captured
+	-- night at exactly this call with `server accepted Return To Lobby` persisted and
+	-- nothing left watching them, which is the shape of bug this whole recorder exists
+	-- to make visible: a remote accepted, a report written, and no movement at all.
+	local returnStep = diagStep("Main.returnToLobby", {
+		expect = "the client leaves this place; reaching the end of this function proves it did not",
+		deadline = 150,
+	})
 	if not waitUntil(function()
 		tryBindRemotes()
 		return genericRemote ~= nil
 	end, tonumber(Settings.runtimeLoadTimeout) or 20) then
+		returnStep.fail("RemoteEvent never replicated, so TeleportToLobby was never sent")
 		fail("REMOTE", "RemoteEvent did not replicate before Return To Lobby.")
 	end
 	local action = recordAction("RETURN_TO_LOBBY", { reason = reason })
@@ -1508,7 +1598,10 @@ local function returnToLobby(reason)
 			local settleDeadline = os.clock() + settleTimeout
 			local failuresBefore = bus.teleportFailureGeneration
 			repeat
-				if not controller.active then return false end
+				if not controller.active then
+					returnStep.noop("the controller was stopped while waiting for the place to change")
+					return false
+				end
 				if bus.teleportFailureGeneration > failuresBefore then break end
 				task.wait(pollInterval)
 			until os.clock() >= settleDeadline
@@ -1533,6 +1626,8 @@ local function returnToLobby(reason)
 			task.wait(tonumber(Settings.transitionRetryDelay) or 1)
 		end
 	end
+	returnStep.noop("every TeleportToLobby attempt was exhausted without the place changing",
+		{ reason = reason, lastFailure = bus.lastTeleportFailure })
 	return false
 end
 
@@ -1820,6 +1915,12 @@ end
 local function run()
 	report.status = "WAITING_FOR_CONTEXT"
 	trace("route start", { placeId = game.PlaceId, userId = player.UserId })
+	-- The route's own root step. Everything the route opens below nests inside it, so
+	-- the parent edges alone reconstruct one account's whole run in order.
+	local routeStep = diagStep("Main.route", {
+		expect = "the place resolves to a lobby portal or a live match runtime",
+		deadline = (tonumber(Settings.runtimeLoadTimeout) or 20) + 60,
+	})
 	local contextReady = waitUntil(function()
 		tryBindRemotes()
 		return resolvePortal() ~= nil
@@ -1862,8 +1963,12 @@ local function run()
 		if lobbyPlaces[game.PlaceId] ~= true and Settings.recoverFromUnknownPlace ~= false then
 			trace("attempting TeleportToLobby to escape a place with no usable runtime")
 			log("CONTEXT", "Attempting Return To Lobby to recover from an unusable place.", diagnosis)
-			if returnToLobby("context never loaded") then return end
+			if returnToLobby("context never loaded") then
+				routeStep.noop("the place had no usable runtime; escaped to the lobby", diagnosis)
+				return
+			end
 		end
+		routeStep.fail("neither a lobby portal nor a stage runtime replicated", diagnosis)
 		fail("CONTEXT", "Neither lobby portal nor stage runtime loaded.")
 	end
 
@@ -1871,10 +1976,12 @@ local function run()
 	-- stale getgc MatchRuntime left behind by an earlier place lifecycle.
 	if resolvePortal() then
 		trace("context LOBBY: Story portal is live")
+		routeStep.ok({ context = "LOBBY" })
 		waitForBootstrapWorkers()
 		runLobby()
 	else
 		trace("context STAGE: no lobby portal, monitoring the match")
+		routeStep.ok({ context = "STAGE" })
 		runStage()
 	end
 end

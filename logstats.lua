@@ -21,6 +21,13 @@ local environment = getgenv()
 local function trace(message, data)
 	local tracer = environment.AnimeOriginTrace
 	if typeof(tracer) == "function" then tracer("LogStats", message, data) end
+	-- The same milestone, in structured form, into the folder capture. Feeding
+	-- the recorder from the existing trace points means the whole milestone
+	-- stream is captured without a second set of call sites to keep in sync.
+	local diag = environment.AnimeOriginDiag
+	if typeof(diag) == "table" and typeof(diag.mark) == "function" then
+		diag.mark("LogStats", message, data)
+	end
 end
 
 -- Stop an older observer before attaching a fresh set of listeners. Re-running

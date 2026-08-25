@@ -26,6 +26,39 @@ local environment = getgenv()
 local function trace(message, data)
 	local tracer = environment.AnimeOriginTrace
 	if typeof(tracer) == "function" then tracer("FastMode", message, data) end
+	-- The same milestone, in structured form, into the folder capture. Feeding
+	-- the recorder from the existing trace points means the whole milestone
+	-- stream is captured without a second set of call sites to keep in sync.
+	local diag = environment.AnimeOriginDiag
+	if typeof(diag) == "table" and typeof(diag.mark) == "function" then
+		diag.mark("FastMode", message, data)
+	end
+end
+
+-- Diagnostics accessors. Resolved per call and always returning something callable,
+-- so instrumentation can never become the reason a controller stops: a client whose
+-- Diag.lua download failed runs exactly as before, minus the folder capture.
+local INERT_STEP = {}
+function INERT_STEP.ok() return INERT_STEP end
+function INERT_STEP.noop() return INERT_STEP end
+function INERT_STEP.fail() return INERT_STEP end
+function INERT_STEP.note() return INERT_STEP end
+function INERT_STEP.because() return INERT_STEP end
+function INERT_STEP.extend() return INERT_STEP end
+
+local function diagStep(name, opts)
+	local diag = environment.AnimeOriginDiag
+	if typeof(diag) ~= "table" or typeof(diag.step) ~= "function" then return INERT_STEP end
+	opts = opts or {}
+	-- Anchor here rather than inside Diag: one level up from this helper is the real
+	-- call site, which is the line a capture has to name when it says where the bug is.
+	if opts.where == nil and typeof(debug) == "table" and typeof(debug.info) == "function" then
+		local ok, source, line = pcall(debug.info, 2, "sl")
+		if ok and source then
+			opts.where = (tostring(source):match("([^/\\]+)$") or tostring(source)) .. ":" .. tostring(line)
+		end
+	end
+	return diag.step(name, opts)
 end
 
 -- Auto-Execute tasks are concurrent in MacSploit, so alphabetical filenames do
@@ -88,6 +121,14 @@ local function publishLifecycle(status, details)
 		userId = player.UserId,
 		details = details,
 	}
+	-- The cross-controller edge, recorded at the write. main.lua's bootstrap gate
+	-- reads exactly this entry, and a worker that dies here without the gate noticing
+	-- is the most expensive chain this project has: the account then stands in the
+	-- lobby until the host is restarted by hand.
+	local diag = environment.AnimeOriginDiag
+	if typeof(diag) == "table" and typeof(diag.signal) == "function" then
+		diag.signal("lifecycle.FastMode", status, details, "FastMode")
+	end
 end
 
 publishLifecycle("RUNNING", { phase = "startup" })
@@ -779,10 +820,20 @@ end
 
 local function claimAllQuests()
 	if not (Settings.claimRewards and Settings.claimRewards.quests) then return end
+	-- The canonical example of why this recorder exists. For every captured run this
+	-- function returned cleanly, wrote a healthy-looking state entry, and never fired
+	-- the remote once -- because a UI-written flag it gated on was false. Nothing in
+	-- the logs could say so, because nothing failed. The declared evidence below is
+	-- the server-written field, so a repeat of that bug reads as NO_OP.
+	local questStep = diagStep("FastMode.claimAllQuests", {
+		expect = "PlayerData Quests[*].Claimed increases, or every record was already claimed",
+		deadline = 60,
+	})
 	local before = readQuestClaimState()
 	if not before.available then
 		state.claimResults.quests = { attempted = false, verified = false, status = "quest_state_missing" }
 		log("SKIP", "PlayerData.Quests is unavailable; ClaimAllQuests was not fired.")
+		questStep.fail("PlayerData.Quests never resolved, so the remote was never fired")
 		return
 	end
 	-- Deliberately NOT gated on before.claimable. `Claimable` is written by the quest
@@ -796,7 +847,17 @@ local function claimAllQuests()
 	-- claims free rewards, so the server simply no-ops when nothing is due; there is
 	-- no budget to overspend. Proof therefore belongs where the rest of this file puts
 	-- it -- after the action, in PlayerData -- rather than in a precondition guess.
-	local remote = requireChild(requireChild(ReplicatedStorage, "LobbyRemotes"), "QuestRemote")
+	-- requireChild raises when the remote never replicates, and it would raise straight
+	-- past the step above -- which the reaper would then report as STUCK, i.e. "still
+	-- running", for something that had already died. Close it honestly, then re-raise
+	-- unchanged so claimConfiguredRewards still records the failure it expects.
+	local remoteResolved, remote = pcall(function()
+		return requireChild(requireChild(ReplicatedStorage, "LobbyRemotes"), "QuestRemote")
+	end)
+	if not remoteResolved then
+		questStep.fail(remote)
+		error(remote, 0)
+	end
 	local beforeGems = readGems()
 	log("ACTION", string.format("Claim All Quests (%d/%d already claimed).", before.claimed, before.records))
 	remote:FireServer("ClaimAllQuests")
@@ -830,12 +891,33 @@ local function claimAllQuests()
 	log("CLAIM", verified and "Claim All Quests verified from PlayerData."
 		or (nothingDue and "Every quest was already claimed before the call."
 			or "Claim All Quests was not confirmed; no blind retry was sent."))
+	local evidence = {
+		claimedBefore = before.claimed,
+		claimedAfter = after.claimed,
+		records = after.records,
+	}
+	if verified or nothingDue then
+		-- nothingDue counts as OK: the account owed nothing, which is a correct outcome
+		-- and must not be reported as the silent failure this step is watching for.
+		questStep.ok(evidence)
+	else
+		questStep.noop("the remote fired and Claimed did not move", evidence)
+	end
 end
 
 -- Independent reward endpoints settle concurrently. This removes the old sum of
 -- several full verification timeouts while preserving each function's own
 -- PlayerData proof and error handling.
 local function claimConfiguredRewards()
+	-- Six accounts died here in one captured night: five concurrent jobs shared a 9s
+	-- budget, the budget expired, and the raise made FastMode FAILED -- which main
+	-- treats as fatal, which killed the route -- while the logs show "Daily Wheel
+	-- verified" written AFTER the FATAL line. The budget is honest now, but a capture
+	-- still has to be able to say the jobs did not all land, without that being fatal.
+	local claimsStep = diagStep("FastMode.claimConfiguredRewards", {
+		expect = "all five reward jobs settle inside the budget",
+		deadline = 240,
+	})
 	local jobs = {
 		{ name = "DailyReward", callback = claimDailyReward },
 		{ name = "PlayTimeRewards", callback = claimPlayTimeRewards },
@@ -902,6 +984,17 @@ local function claimConfiguredRewards()
 	end
 	if not settled or next(failures) ~= nil then
 		saveState(state, "claims_degraded_but_nonfatal")
+	end
+	local failedNames = {}
+	for name in next, failures do table.insert(failedNames, name) end
+	if settled and #failedNames == 0 then
+		claimsStep.ok({ jobs = #jobs, timeout = timeout })
+	elseif not settled then
+		claimsStep.noop(string.format("%d of %d jobs were still running after %ds",
+			remaining, #jobs, timeout), { failed = failedNames })
+	else
+		claimsStep.noop("every job settled but some raised: " .. table.concat(failedNames, ", "),
+			{ failed = failedNames })
 	end
 end
 
@@ -1218,6 +1311,12 @@ local function runStageQuestLoop()
 		if maximumAttempts > 0 and attempts >= maximumAttempts then break end
 		attempts += 1
 
+		-- One step per attempt, not one per loop: an hours-long loop held open would
+		-- be reported STUCK on its first reap and say nothing about any single claim.
+		local attemptStep = diagStep("FastMode.stageQuestClaim", {
+			expect = "Claimed increases, or nothing was due this interval",
+			deadline = 60,
+		})
 		local ok, claimedNow = pcall(function()
 			local before = readQuestClaimState()
 			if not before.available then return nil end
@@ -1238,10 +1337,22 @@ local function runStageQuestLoop()
 				attempt = attempts, claimed = claimedNow,
 			})
 			trace("stage quests claimed", { attempt = attempts, claimed = claimedNow })
+			attemptStep.ok({ attempt = attempts, claimed = claimedNow })
 		elseif not ok then
 			debugLog("STAGE_QUESTS", "Claim attempt raised; retrying on the next interval.", {
 				attempt = attempts, error = tostring(claimedNow),
 			})
+			attemptStep.fail(claimedNow, { attempt = attempts })
+		elseif claimedNow == nil then
+			-- Distinct from `false`: PlayerData never resolved, so nothing was even
+			-- attempted. In a stage that is the open question this loop was written to
+			-- answer, and it must not be filed under "nothing was due".
+			attemptStep.fail("PlayerData.Quests never resolved in this place", { attempt = attempts })
+		else
+			-- A whole night of these with no ok() is the fingerprint of quests that
+			-- never actually complete in a stage -- which would mean the loop is
+			-- pointless, and no existing log could tell us that.
+			attemptStep.noop("the remote fired and Claimed did not move", { attempt = attempts })
 		end
 
 		environment.AnimeOriginFastModeReport = {

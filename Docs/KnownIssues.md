@@ -246,6 +246,48 @@ AnimeOriginMain                AnimeOriginLifecycle
 
 ---
 
+## ยังไม่ได้พิสูจน์ (รอ capture รอบหน้า)
+
+รายการนี้แยกจากทุกหัวข้อข้างบนโดยตั้งใจ ข้างบนคือสิ่งที่ตรวจกับซอร์สหรือกับ log จริงแล้ว
+ข้างล่างนี้คือสิ่งที่ **ยังไม่มีหลักฐาน** — เขียนไว้เพื่อไม่ให้ถูกเผลอเล่าเป็นข้อเท็จจริง
+
+- **`Diag.lua` ยังไม่เคยรันบนไคลเอนต์จริงสักตัว** ผ่าน `luau` ใต้ stub และผ่านเกต static
+  แต่ทั้งสองอย่างไม่ได้พิสูจน์เรื่อง executor: `writefile` ที่มีโฟลเดอร์ซ้อน,
+  `debug.info` บน Voit, และ overhead ตอน 54 client เขียน digest พร้อมกัน
+  capture แรกคือการทดสอบ ไม่ใช่การยืนยัน
+- **place `135941552414666` คืออะไรกันแน่** Config จัดเป็น stage แต่หลักฐานขัดกัน:
+  ไม่มี `MatchRuntime` ไม่มี `Workspace.Towers` แต่มี PlayerData และ
+  `ReplicatedStorage.Constants.GameSpeed` และ InGameSettings วน
+  `GameSpeed reset detected; re-applying` 150 บรรทัด — พฤติกรรมแบบล็อบบี้
+  ไอดีที่ปกติ 27 ตัวอยู่ใน `116173040971120` ทั้งหมด แบ่งขาดตาม place
+  **สงสัยว่าเป็นล็อบบี้ตัวที่สองที่ถูกจัดผิดประเภท** — บรรทัด `portalPath` ใน CONTEXT
+  และ step `Main.route` ควรตอบได้ใน capture หน้า
+- **`Claimed` ขยับจริงหรือเปล่าเมื่อเรายิง `ClaimAllQuests`** ไม่เคยสังเกตได้
+  เพราะก่อนหน้านี้มันไม่เคยยิงเลย ถ้า step `FastMode.claimAllQuests` ขึ้น `NO_OP` ทุกไอดี
+  แปลว่าสมมติฐานเรื่อง `Claimed` ผิดด้วย
+- **PlayerData resolve ได้ในด่านหรือไม่** อนุมานจากดีไซน์ของ logstats/AutoPlay
+  ยังไม่มี capture จาก stage ที่ยืนยันตรงๆ — step `FastMode.stageQuestClaim`
+  แยก `FAIL` (PlayerData ไม่ resolve) ออกจาก `NO_OP` (resolve ได้แต่ไม่มีอะไรขยับ) ไว้แล้ว
+- **AutoPlay report JSON ไม่มีเพดานขนาด** median ~213 KB, max 353 KB
+  และมีไฟล์หนึ่งใน capture ที่ถูกตัดกลางคันพอดีที่ 327,680 ไบต์
+
+---
+
+## โฟลเดอร์ดีบัก AnimeOriginDiag (ใหม่)
+
+ดูรายละเอียดใน README หัวข้อ "โฟลเดอร์ดีบัก" สรุปสั้นๆ:
+
+- `AnimeOriginDiag/` **แยกจาก `AnimeOrigin/` ลบทิ้งได้ตลอดเวลา**
+  ที่แยกเพราะ `AnimeOrigin/` มี `FastModeBootstrap_*.json` และ `MainRoute_*.json`
+  ซึ่งเป็น state จริง — ถ้าอยู่โฟลเดอร์เดียวกัน "การล้าง log" กับ "การทำลาย state"
+  จะหน้าตาเหมือนกันเป๊ะ
+- ส่งมาให้วิเคราะห์: zip เฉพาะ `digest_*.json` ก็พอ (~4–8 KB ต่อไอดี)
+  ถ้าอยากได้ละเอียดค่อยแนบ `events_*.jsonl` ด้วย
+- `.gitignore` กัน `AnimeOriginDiag/`, `digest_*.json`, `events_*.jsonl` ไว้แล้ว
+  **ไฟล์พวกนี้มี UserId และ repo นี้ public**
+
+---
+
 ## ไม่ใช่บั๊กของเรา
 
 อาการสองอย่างนี้โผล่ตอนเครื่องโหลดหนัก อย่าเสียเวลาไล่แก้ในโค้ดนี้:

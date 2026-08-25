@@ -2,3 +2,8 @@
 __pycache__/
 *.pyc
 
+
+# Diagnostics captures contain Roblox UserIds and this repository is public.
+AnimeOriginDiag/
+digest_*.json
+events_*.jsonl

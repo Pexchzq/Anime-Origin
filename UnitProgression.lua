@@ -27,6 +27,39 @@ local environment = getgenv()
 local function trace(message, data)
 	local tracer = environment.AnimeOriginTrace
 	if typeof(tracer) == "function" then tracer("UnitProgress", message, data) end
+	-- The same milestone, in structured form, into the folder capture. Feeding
+	-- the recorder from the existing trace points means the whole milestone
+	-- stream is captured without a second set of call sites to keep in sync.
+	local diag = environment.AnimeOriginDiag
+	if typeof(diag) == "table" and typeof(diag.mark) == "function" then
+		diag.mark("UnitProgress", message, data)
+	end
+end
+
+-- Diagnostics accessors. Resolved per call and always returning something callable,
+-- so instrumentation can never become the reason a controller stops: a client whose
+-- Diag.lua download failed runs exactly as before, minus the folder capture.
+local INERT_STEP = {}
+function INERT_STEP.ok() return INERT_STEP end
+function INERT_STEP.noop() return INERT_STEP end
+function INERT_STEP.fail() return INERT_STEP end
+function INERT_STEP.note() return INERT_STEP end
+function INERT_STEP.because() return INERT_STEP end
+function INERT_STEP.extend() return INERT_STEP end
+
+local function diagStep(name, opts)
+	local diag = environment.AnimeOriginDiag
+	if typeof(diag) ~= "table" or typeof(diag.step) ~= "function" then return INERT_STEP end
+	opts = opts or {}
+	-- Anchor here rather than inside Diag: one level up from this helper is the real
+	-- call site, which is the line a capture has to name when it says where the bug is.
+	if opts.where == nil and typeof(debug) == "table" and typeof(debug.info) == "function" then
+		local ok, source, line = pcall(debug.info, 2, "sl")
+		if ok and source then
+			opts.where = (tostring(source):match("([^/\\]+)$") or tostring(source)) .. ":" .. tostring(line)
+		end
+	end
+	return diag.step(name, opts)
 end
 
 -- MacSploit starts Auto-Execute files without a dependable inter-file order.
@@ -82,6 +115,14 @@ local function publishLifecycle(status, details)
 		userId = player.UserId,
 		details = details,
 	}
+	-- The cross-controller edge, recorded at the write. main.lua's bootstrap gate
+	-- reads exactly this entry, and a worker that dies here without the gate noticing
+	-- is the most expensive chain this project has: the account then stands in the
+	-- lobby until the host is restarted by hand.
+	local diag = environment.AnimeOriginDiag
+	if typeof(diag) == "table" and typeof(diag.signal) == "function" then
+		diag.signal("lifecycle.UnitProgression", status, details, "UnitProgression")
+	end
 end
 
 -- Persistent inventory progression is lobby-only. A stage teleport starts a new
@@ -113,19 +154,34 @@ local function waitForFastModeDependency()
 	if typeof(Config.fastGems) == "table" and Config.fastGems.enabled == false then return end
 	local gate = Config.main and Config.main.bootstrapGate
 	local timeout = (typeof(gate) == "table" and tonumber(gate.timeout)) or 300
+	-- The middle link of the longest chain in the project: FastMode dies, this waits
+	-- out the full bootstrap timeout, publishes FAILED, and main's gate then sees TWO
+	-- dead workers -- of which only the first is a real fault. The because() edges
+	-- below are what let a capture say that out loud instead of blaming both.
+	local dependencyStep = diagStep("UnitProgression.waitForFastMode", {
+		expect = "lifecycle.FastMode reaches COMPLETE",
+		deadline = timeout + 15,
+	})
 	local deadline = os.clock() + timeout
 	repeat
 		local lifecycle = environment.AnimeOriginLifecycle
 		local entry = typeof(lifecycle) == "table" and lifecycle.jobId == game.JobId
 			and typeof(lifecycle.tasks) == "table" and lifecycle.tasks.FastMode or nil
 		local status = typeof(entry) == "table" and tostring(entry.status) or "PENDING"
-		if status == "COMPLETE" then return end
+		if status == "COMPLETE" then
+			dependencyStep.ok()
+			return
+		end
 		if status == "FAILED" then
+			dependencyStep.because("lifecycle.FastMode")
+			dependencyStep.fail("FastMode reported FAILED, so progression never started")
 			publishLifecycle("FAILED", { phase = "dependency", error = "FastMode failed" })
 			error("[UnitProgression][DEPENDENCY] FastMode failed; inventory progression was not started.", 0)
 		end
 		task.wait(0.1)
 	until os.clock() >= deadline
+	dependencyStep.because("lifecycle.FastMode")
+	dependencyStep.fail(string.format("FastMode never reached a terminal status within %ss", tostring(timeout)))
 	publishLifecycle("FAILED", { phase = "dependency", error = "FastMode timeout" })
 	error("[UnitProgression][DEPENDENCY] Timed out waiting for FastMode completion.", 0)
 end

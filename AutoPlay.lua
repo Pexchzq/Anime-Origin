@@ -35,6 +35,39 @@ local environment = getgenv()
 local function trace(message, data)
 	local tracer = environment.AnimeOriginTrace
 	if typeof(tracer) == "function" then tracer("AutoPlay", message, data) end
+	-- The same milestone, in structured form, into the folder capture. Feeding
+	-- the recorder from the existing trace points means the whole milestone
+	-- stream is captured without a second set of call sites to keep in sync.
+	local diag = environment.AnimeOriginDiag
+	if typeof(diag) == "table" and typeof(diag.mark) == "function" then
+		diag.mark("AutoPlay", message, data)
+	end
+end
+
+-- Diagnostics accessors. Resolved per call and always returning something callable,
+-- so instrumentation can never become the reason a controller stops: a client whose
+-- Diag.lua download failed runs exactly as before, minus the folder capture.
+local INERT_STEP = {}
+function INERT_STEP.ok() return INERT_STEP end
+function INERT_STEP.noop() return INERT_STEP end
+function INERT_STEP.fail() return INERT_STEP end
+function INERT_STEP.note() return INERT_STEP end
+function INERT_STEP.because() return INERT_STEP end
+function INERT_STEP.extend() return INERT_STEP end
+
+local function diagStep(name, opts)
+	local diag = environment.AnimeOriginDiag
+	if typeof(diag) ~= "table" or typeof(diag.step) ~= "function" then return INERT_STEP end
+	opts = opts or {}
+	-- Anchor here rather than inside Diag: one level up from this helper is the real
+	-- call site, which is the line a capture has to name when it says where the bug is.
+	if opts.where == nil and typeof(debug) == "table" and typeof(debug.info) == "function" then
+		local ok, source, line = pcall(debug.info, 2, "sl")
+		if ok and source then
+			opts.where = (tostring(source):match("([^/\\]+)$") or tostring(source)) .. ":" .. tostring(line)
+		end
+	end
+	return diag.step(name, opts)
 end
 
 -- MacSploit may inject AutoPlay before Config.lua on a new place lifecycle.
@@ -2607,8 +2640,24 @@ local traceback = function(message)
 end
 
 local ok, result
+-- One step per supervised attempt. Five silent restarts in a row is the fingerprint
+-- of an account trapped in a place AutoPlay cannot use, and the captured night had
+-- exactly that: restarted five times, stopped, and stood still until morning. Each
+-- attempt records its own verdict so a digest shows the repetition rather than only
+-- the final outcome.
 for attempt = 0, maximumRestarts do
+	local attemptStep = diagStep("AutoPlay.monitorAttempt", {
+		expect = "the match monitor runs to completion without raising",
+		deadline = 900,
+	})
 	ok, result = xpcall(run, traceback)
+	if ok then
+		attemptStep.ok({ attempt = attempt })
+	elseif controller.stopRequested then
+		attemptStep.noop("stop requested while the monitor was running", { attempt = attempt })
+	else
+		attemptStep.fail(tostring(result):match("^[^\n]*"), { attempt = attempt })
+	end
 	if ok or controller.stopRequested then break end
 	if attempt >= maximumRestarts then
 		log("SUPERVISOR", "Restart budget exhausted; AutoPlay is stopping for this session.", {
