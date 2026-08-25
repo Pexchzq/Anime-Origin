@@ -98,23 +98,38 @@ trace("start", { placeId = game.PlaceId, userId = player.UserId })
 -- reported as a bootstrap failure.
 local lobbyPlaces = Config.runtimePlaces and Config.runtimePlaces.lobby
 local isLobbyPlace = typeof(lobbyPlaces) == "table" and lobbyPlaces[game.PlaceId] == true
+local StageQuests = typeof(Settings.stageQuestClaim) == "table" and Settings.stageQuestClaim or {}
+-- In a stage the bootstrap itself does not apply, but quests keep completing there.
+-- Publish SKIPPED here and now rather than at the end: main's bootstrap gate reads
+-- this entry, and delaying it behind a claim loop would make a stage-side FastMode
+-- look like a worker that never reported.
+local stageQuestOnly = false
 if not isLobbyPlace then
-	local skipped = { status = "SKIPPED_STAGE", placeId = game.PlaceId, jobId = game.JobId }
 	publishLifecycle("SKIPPED", { phase = "context", reason = "stage place" })
-	trace("SKIPPED: stage place, lobby bootstrap does not apply here")
-	if environment.AnimeOriginFastModeRunning == runToken then
-		environment.AnimeOriginFastModeRunning = nil
+	if StageQuests.enabled ~= true then
+		local skipped = { status = "SKIPPED_STAGE", placeId = game.PlaceId, jobId = game.JobId }
+		trace("SKIPPED: stage place, lobby bootstrap does not apply here")
+		if environment.AnimeOriginFastModeRunning == runToken then
+			environment.AnimeOriginFastModeRunning = nil
+		end
+		environment.AnimeOriginFastModeReport = skipped
+		if not consoleStatusOnly then
+			print("[FastMode] Stage place detected; lobby bootstrap skipped.")
+		end
+		return skipped
 	end
-	environment.AnimeOriginFastModeReport = skipped
-	if not consoleStatusOnly then
-		print("[FastMode] Stage place detected; lobby bootstrap skipped.")
-	end
-	return skipped
+	stageQuestOnly = true
+	trace("stage place: bootstrap skipped, quest claim loop will run")
 end
 
 local stateFolder = tostring(Settings.stateFolder or "AnimeOrigin")
+-- Separate names in stage mode, for two reasons that both cost a whole run if
+-- ignored: this file truncates its log on load, and the bootstrap state file holds
+-- the account's summon progress. A stage-side run must not overwrite either.
 local stateFile = stateFolder .. "/FastModeBootstrap_" .. tostring(player.UserId) .. ".json"
-local logFile = stateFolder .. "/FastModeBootstrap_" .. tostring(player.UserId) .. "_latest.log"
+local logFile = stageQuestOnly
+	and (stateFolder .. "/FastModeStageQuests_" .. tostring(player.UserId) .. "_latest.log")
+	or (stateFolder .. "/FastModeBootstrap_" .. tostring(player.UserId) .. "_latest.log")
 local logBuffer = {}
 local sequence = 0
 -- Both bounds must stay in step with the identical block in main.lua, AutoPlay.lua,
@@ -574,7 +589,10 @@ local function classifyRedeemResponse(invokeSucceeded, response)
 	return "unknown"
 end
 
-local state = loadState()
+-- The stage quest loop never reads or writes bootstrap state, and loadState fails
+-- hard on a corrupt file. Loading it there would let a damaged bootstrap record
+-- block quest claiming in a stage, which has nothing to do with it.
+local state = not stageQuestOnly and loadState() or nil
 
 local function redeemCodes()
 	local codesFunction = requireChild(requireChild(ReplicatedStorage, "LobbyRemotes"), "CodesFunction")
@@ -1133,6 +1151,99 @@ local function run()
 		stateFile = stateFile,
 		logFile = logFile,
 	}
+end
+
+-- Stage-side quest claiming. Deliberately a loop rather than a one-shot: quests
+-- complete mid-match, and an Infinite farm restarts with RestartGame without ever
+-- passing through the lobby, so there is no other moment to hook.
+--
+-- It reuses this file's PlayerData resolution on purpose. A private copy would have
+-- to re-solve the wrapper-versus-detached-table problem that every claim in this
+-- project depends on, and a stage-side loop binding a dead table would report
+-- success forever while claiming nothing.
+local function runStageQuestLoop()
+	local startupDelay = math.max(0, tonumber(StageQuests.startupDelay) or 30)
+	local interval = math.max(15, tonumber(StageQuests.interval) or 180)
+	local jitter = math.max(0, tonumber(StageQuests.jitter) or 45)
+	local maximumAttempts = math.max(0, math.floor(tonumber(StageQuests.maximumAttempts) or 0))
+
+	log("STAGE_QUESTS", "Stage quest claim loop armed.", {
+		placeId = game.PlaceId,
+		startupDelay = startupDelay,
+		interval = interval,
+	})
+	task.wait(startupDelay + math.random() * jitter)
+
+	local attempts, claims, lastClaimed = 0, 0, nil
+	-- No terminal condition of its own: a real place transition tears this script
+	-- down, which is what ends the loop. The JobId guard only stops a loop that
+	-- somehow outlived its server.
+	while game.JobId == runToken.jobId do
+		if maximumAttempts > 0 and attempts >= maximumAttempts then break end
+		attempts += 1
+
+		local ok, claimedNow = pcall(function()
+			local before = readQuestClaimState()
+			if not before.available then return nil end
+			local remote = requireChild(requireChild(ReplicatedStorage, "LobbyRemotes"), "QuestRemote")
+			remote:FireServer("ClaimAllQuests")
+			local verified = verifyWithRescan(function()
+				return readQuestClaimState().claimed > before.claimed
+			end, Bootstrap.claimSettlementTimeout)
+			return verified and readQuestClaimState().claimed or false
+		end)
+
+		-- Log on CHANGE only. A silent no-op every few minutes for a whole night is
+		-- exactly the unbounded log growth the rest of this project already fixed.
+		if ok and claimedNow then
+			claims += 1
+			lastClaimed = claimedNow
+			log("STAGE_QUESTS", "Claimed quests during the stage.", {
+				attempt = attempts, claimed = claimedNow,
+			})
+			trace("stage quests claimed", { attempt = attempts, claimed = claimedNow })
+		elseif not ok then
+			debugLog("STAGE_QUESTS", "Claim attempt raised; retrying on the next interval.", {
+				attempt = attempts, error = tostring(claimedNow),
+			})
+		end
+
+		environment.AnimeOriginFastModeReport = {
+			status = "STAGE_QUEST_LOOP",
+			placeId = game.PlaceId,
+			jobId = game.JobId,
+			attempts = attempts,
+			claims = claims,
+			claimed = lastClaimed,
+			logFile = logFile,
+		}
+		task.wait(interval + math.random() * jitter)
+	end
+end
+
+if stageQuestOnly then
+	local ok, loopError = xpcall(runStageQuestLoop, function(message)
+		return debug and debug.traceback and debug.traceback(tostring(message), 2) or tostring(message)
+	end)
+	if environment.AnimeOriginFastModeRunning == runToken then
+		environment.AnimeOriginFastModeRunning = nil
+	end
+	if not ok then
+		-- The lifecycle entry stays SKIPPED: it was already published and is correct.
+		-- Only main's routing reads it, and a failed stage-side claim loop must never
+		-- look like a failed lobby bootstrap.
+		trace("stage quest loop FAILED", { error = tostring(loopError):sub(1, 220) })
+		log("STAGE_QUESTS", "Stage quest loop stopped on an error.", { error = tostring(loopError) })
+	end
+	local stageResult = {
+		status = "STAGE_QUEST_LOOP_ENDED",
+		placeId = game.PlaceId,
+		jobId = game.JobId,
+		error = not ok and tostring(loopError) or nil,
+		logFile = logFile,
+	}
+	environment.AnimeOriginFastModeReport = stageResult
+	return stageResult
 end
 
 local ok, result = xpcall(run, function(message)

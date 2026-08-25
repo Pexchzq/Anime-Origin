@@ -8,7 +8,7 @@
 | --- | --- |
 | `Loader.lua` | ตัวโหลดสำหรับ executor ที่รันจาก URL (Volthelper/Voit) รอ `game:IsLoaded()`, arm `queue_on_teleport`, หน่วงแบบสุ่ม แล้วดาวน์โหลด Config + worker ทั้งหมด |
 | `Config.lua` | คอนฟิกกลาง ต้องรันก่อนสคริปต์ที่อ่านการตั้งค่า |
-| `FastMode.lua` | เคลมรางวัลและเควสทุกไอดี; เฉพาะบัญชีใหม่จึงสุ่มตาม Gems โดยยืนยัน `TotalSummons` และยอด Gems ทุกชุด |
+| `FastMode.lua` | เคลมรางวัลและเควสทุกไอดี; เฉพาะบัญชีใหม่จึงสุ่มตาม Gems โดยยืนยัน `TotalSummons` และยอด Gems ทุกชุด ในด่านจะข้าม bootstrap แต่ยังวนเคลมเควสต่อ |
 | `UnitProgression.lua` | ล็อกยูนิตที่กำหนด จัดอันดับ Top 6 ย่อยตัวซ้ำ ซื้อ/ป้อน Food และเฉลี่ยเลเวล 1–3 ก่อน 4–6 |
 | `InGameSettings.lua` | ซิงก์ Settings, Game Speed และ Summon Auto Sell จากค่าจริงใน PlayerData |
 | `AutoPlay.lua` | เลือกทีม วาง และอัปเกรดยูนิตภายในด่าน |
@@ -262,6 +262,36 @@ Probes/MainFlowStateProbe.lua
 `AnimeOrigin/MainFlowProbe_latest.json` และประวัติเหตุการณ์อยู่ที่
 `AnimeOrigin/MainFlowProbe_trace.jsonl` ใน workspace ของ executor หยุดด้วย
 `AnimeOriginMainFlowProbe.stop()`
+
+## การเคลมเควส
+
+`Claimable` ใน `PlayerData.Quests` **ถูกเขียนโดย UI ของเควสตอน render ไม่ใช่ค่าที่เซิร์ฟเวอร์
+replicate** โปรเจกต์นี้อ่าน PlayerData โดยไม่เปิด UI จึงเห็น `false` เสมอ (396 จาก 396
+record ใน capture) การเอาไปเป็นเงื่อนไขก่อนยิงจึงบล็อกการเคลมทั้งหมด — `ClaimAllQuests`
+ไม่เคยถูกยิงเลยสักครั้งบนไอดีไหนก็ตาม
+
+ตอนนี้ยิงโดยไม่มีเกต แล้วพิสูจน์จาก `Claimed` ซึ่งเซิร์ฟเวอร์เป็นคนเขียน การเคลมรางวัลฟรี
+ไม่มีงบให้เสีย เซิร์ฟเวอร์ no-op เองเมื่อไม่มีอะไรให้เคลม ต่างจากการสุ่มที่เสียเพชร
+
+เควสสร้างความคืบหน้า**ระหว่างแมตช์** และ Infinite ใช้ `RestartGame` โดยไม่กลับล็อบบี้
+FastMode จึงยังเป็น worker ของล็อบบี้เหมือนเดิม แต่ในด่านจะ publish `SKIPPED` ทันที
+(main's bootstrap gate อ่านค่านี้ ห้ามหน่วง) แล้วเปิดลูปเคลมเควสค้างไว้:
+
+```lua
+Config.fastGems.stageQuestClaim = {
+	enabled = true,
+	startupDelay = 30,  -- ให้แมตช์เริ่มก่อน
+	interval = 180,
+	jitter = 45,        -- กัน 54 client ยิงรีโมตพร้อมกันทุก interval
+	maximumAttempts = 0, -- 0 = ตลอดอายุของด่านนั้น
+}
+```
+
+ลูปนี้แยกไฟล์ล็อกเป็น `FastModeStageQuests_<UserId>_latest.log` และ **ไม่แตะ
+bootstrap state** เลย เพราะไฟล์นั้นเก็บความคืบหน้าการสุ่มของล็อบบี้ และไฟล์ล็อกจะถูก
+truncate ตอนโหลด ล็อกเฉพาะตอนเคลมได้จริงเท่านั้น ไม่ล็อก no-op
+
+ล็อกไว้ด้วย `Tests/check_quest_claim_gate.py`
 
 ## การวินิจฉัยจาก F9
 

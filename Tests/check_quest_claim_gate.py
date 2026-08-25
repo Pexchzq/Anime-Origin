@@ -98,11 +98,73 @@ def check_reader_reports_both_fields(failures: list[str]) -> None:
             fail(f"readQuestClaimState no longer reports `{field}`", failures)
 
 
+def check_stage_loop_is_isolated(failures: list[str]) -> None:
+    """Quests complete during a match, and Infinite restarts with RestartGame without
+    ever passing through the lobby -- so a stage-side claim loop is the only place
+    those get collected. It shares this file with the lobby bootstrap, which makes
+    three collisions possible, each of which costs a whole account's run:
+
+    - the log file is truncated on load, so a stage run must not use the lobby name;
+    - the bootstrap state file holds summon progress and must never be written from
+      a stage, nor be able to block the loop when it is corrupt;
+    - main's bootstrap gate reads the lifecycle entry, so SKIPPED has to be published
+      before the loop starts rather than after it ends.
+    """
+    source = (ROOT / "FastMode.lua").read_text(encoding="utf-8")
+
+    if "stageQuestOnly" not in source:
+        fail("FastMode.lua has no stage quest path", failures)
+        return
+
+    if "FastModeStageQuests_" not in source:
+        fail(
+            "the stage quest loop shares the lobby log file name; loading truncates "
+            "it, so a stage entry would erase the lobby bootstrap log",
+            failures,
+        )
+
+    if not re.search(r"local state = not stageQuestOnly and loadState\(\)", source):
+        fail(
+            "the stage path still loads bootstrap state; a corrupt state file would "
+            "block quest claiming in a stage, which does not depend on it",
+            failures,
+        )
+
+    loop = re.search(r"local function runStageQuestLoop\(\)(.*?)\nend\n", source, re.S)
+    if not loop:
+        fail("runStageQuestLoop was not found", failures)
+        return
+    if "saveState" in loop.group(1):
+        fail(
+            "the stage quest loop writes bootstrap state; summon progress belongs to "
+            "the lobby run alone",
+            failures,
+        )
+    # Unbounded growth is the failure this project keeps having; a loop that logs
+    # every no-op for a whole night reintroduces it.
+    if 'log("STAGE_QUESTS", "Claimed quests during the stage."' not in loop.group(1):
+        fail(
+            "the stage quest loop does not log on a successful claim, or logs "
+            "unconditionally; it must log on change only",
+            failures,
+        )
+
+    # SKIPPED must be published on the stage branch itself, not deferred.
+    branch = re.search(r"if not isLobbyPlace then(.*?)\nend\n", source, re.S)
+    if branch and 'publishLifecycle("SKIPPED"' not in branch.group(1):
+        fail(
+            "the stage branch no longer publishes SKIPPED up front; main's bootstrap "
+            "gate would see a worker that never reported",
+            failures,
+        )
+
+
 def main() -> int:
     failures: list[str] = []
     check_no_claimable_precondition(failures)
     check_verification_uses_claimed(failures)
     check_reader_reports_both_fields(failures)
+    check_stage_loop_is_isolated(failures)
 
     if failures:
         print(f"\n[QuestClaimGate] {len(failures)} check(s) failed")

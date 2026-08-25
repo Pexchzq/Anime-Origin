@@ -111,6 +111,25 @@ local Config = {
 			dailyWheel = true,
 			quests = true,
 		},
+
+		-- Quests complete DURING a match, and the lobby claim only runs on a lobby
+		-- join. Infinite restarts with RestartGame without ever returning to the
+		-- lobby, so a long Infinite farm could go hours with completed quests unclaimed.
+		-- FastMode therefore stays a lobby bootstrap worker but keeps a small claim
+		-- loop alive in a stage place.
+		stageQuestClaim = {
+			enabled = true,
+			-- Let the match actually start before the first attempt; PlayerData and
+			-- LobbyRemotes are still settling right after the place teleport.
+			startupDelay = 30,
+			interval = 180,
+			-- 54 clients that all entered a stage together would otherwise fire this
+			-- remote in the same second, every interval, for the rest of the night.
+			jitter = 45,
+			-- Bounds the whole loop, not one attempt. 0 means "for as long as this
+			-- stage lasts", which is what a long Infinite run needs.
+			maximumAttempts = 0,
+		},
 		dailyRewardType = "Normal",
 		playTimeRewardIndices = { 1, 2, 3, 4, 5, 6 },
 		battlepassSeason = "Season1",
