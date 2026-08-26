@@ -231,4 +231,10 @@ Before reporting:
 ## References
 
 - `references/case-files.md` — the eight real bugs, each with symptom, what the log said, what was actually true, why it was invisible, and the rule it produced.
+- `references/ui-layer-bypass.md` — automating an application through the seam its own
+  UI uses: reading live state from the runtime heap (and the live-versus-detached-copy
+  trap that makes working actions look broken), satisfying a server's real precondition
+  instead of the UI's choreography, surviving context resets, and fleet-scale etiquette.
+  Presentation layer only — it does not cover, and this skill does not endorse, defeating
+  security controls.
 - `references/harness.md` — building an executable harness for code that cannot run in situ (stubs, virtual clock, splicing real sources), plus the mutation-testing recipe for static gates.

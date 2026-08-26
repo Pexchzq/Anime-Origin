@@ -424,6 +424,7 @@ Config.debugRecorder.defaultStepDeadline -- 90
 | --- | --- |
 | `SKILL.md` | กฎ 10 ข้อ + เช็คลิสต์ก่อนเขียน/ก่อนปิดงาน/ก่อนรายงาน |
 | `references/case-files.md` | บั๊กจริง 8 ตัว: อาการ → ล็อกบอกว่าอะไร → ความจริงคืออะไร → **ทำไมถึงมองไม่เห็น** → กฎที่ได้มา |
+| `references/ui-layer-bypass.md` | เทคนิคทำงานใต้ UI: อ่าน state จาก heap (พร้อมกับดัก live vs สำเนาที่ตายแล้ว), ยิง precondition ที่เซิร์ฟเวอร์เช็คจริงแทนการเลียนแบบ UI, รอดจาก context reset, มารยาทตอนรันหลายสิบไคลเอนต์ |
 | `references/harness.md` | วิธีสร้าง harness รันโค้ดที่รันในที่จริงไม่ได้ (stub + นาฬิกาเสมือน) และวิธี mutation-test เกต |
 
 ข้อที่ใช้บ่อยที่สุดสามข้อ:
