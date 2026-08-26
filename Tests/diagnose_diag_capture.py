@@ -3,7 +3,7 @@
 
     Tests/diagnose_diag_capture.py                     # the live capture folder
     Tests/diagnose_diag_capture.py ~/Downloads/x.zip   # a capture sent for analysis
-    Tests/diagnose_diag_capture.py --account 11571254010
+    Tests/diagnose_diag_capture.py --account 1000000001
     Tests/diagnose_diag_capture.py --events            # include the raw event tails
 
 Nothing here reads Lua source. Every line printed comes from what the clients

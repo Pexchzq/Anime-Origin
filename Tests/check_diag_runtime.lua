@@ -76,7 +76,9 @@ end
 local HttpService = { __instance = true }
 function HttpService:JSONEncode(value) return encodeJson(value) end
 
-local Players = { __instance = true, LocalPlayer = { __instance = true, UserId = 11571254010 } }
+-- Deliberately a synthetic id. This repository is public and auto-executed by every
+-- client; a real UserId in a fixture is a permanent disclosure for no test value.
+local Players = { __instance = true, LocalPlayer = { __instance = true, UserId = 1000000001 } }
 
 -- Config.lua holds real map coordinates, so the datatype has to exist for the file to
 -- load. Nothing in Diag touches it; this is purely so the REAL Config can be spliced
@@ -245,8 +247,8 @@ end)())
 -- ---------------------------------------------------------------------------
 print("\n[DiagRuntime] files")
 Diag.flush()
-local digestPath = "AnimeOriginDiag/digest_11571254010.json"
-local eventsPath = "AnimeOriginDiag/events_11571254010.jsonl"
+local digestPath = "AnimeOriginDiag/digest_1000000001.json"
+local eventsPath = "AnimeOriginDiag/events_1000000001.jsonl"
 check("digest written to the diagnostics folder", disk[digestPath] ~= nil)
 check("events written to the diagnostics folder", disk[eventsPath] ~= nil)
 check("README explains the folder is deletable",
